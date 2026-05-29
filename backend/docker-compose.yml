@@ -1,0 +1,172 @@
+# Autotest Backend Docker Compose Configuration
+#
+# Usage:
+#   docker compose up -d              # Start all services
+#   docker compose logs -f            # View logs
+#   docker compose down               # Stop all services
+#
+# Architecture:
+#   The Orchestrator (port 8000) is the ONLY externally-exposed service.
+#   All requests from the Chrome extension go through it.
+#   Generator, Runner, and Registry are internal-only.
+#
+# Claude Authentication:
+#   Option A (default): mount host ~/.claude/ — works if you already ran `claude login` on host
+#   Option B: docker exec -it autotest-generator claude login
+#             Then swap the volume mount (see generator volumes below)
+
+services:
+  # ===========================================
+  # Orchestrator — Central API Gateway (port 8000)
+  # ===========================================
+  # Single entry point for the Chrome extension.
+  # Authenticates all requests and routes to internal services.
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    container_name: autotest-orchestrator
+    ports:
+      - "${ORCHESTRATOR_PORT:-8000}:8000"
+    environment:
+      - REGISTRY_URL=http://registry:8003
+      - GENERATOR_URL=http://generator:8002
+      - RUNNER_URL=http://runner:8001
+    restart: unless-stopped
+    networks:
+      - autotest-network
+    depends_on:
+      - registry
+      - generator
+      - runner
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ===========================================
+  # Generator — Claude CLI + Playwright MCP test generation (internal)
+  # ===========================================
+  generator:
+    build:
+      context: .
+      dockerfile: Dockerfile.generator
+    container_name: autotest-generator
+    # No ports exposed — accessed only via orchestrator
+    environment:
+      - MCP_TIMEOUT=${MCP_TIMEOUT:-300}
+      - QUERY_TIMEOUT=${QUERY_TIMEOUT:-120}
+      - GENERATED_TESTS_DIR=/app/generated-tests
+      - TESTS_STORE_ROOT=/app/tests-store
+      - REGISTRY_URL=http://registry:8003
+      - RUNNER_URL=http://runner:8001
+    volumes:
+      - generated-tests:/app/generated-tests
+      - tests-store:/app/tests-store
+      # Option A (default): mount host Claude credentials
+      - ${HOME}/.claude:/root/.claude
+      # Option B (self-contained): uncomment volume below, comment bind mount above
+      # - claude-credentials:/root/.claude
+    restart: unless-stopped
+    networks:
+      - autotest-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ===========================================
+  # Playwright Runner — Headless browser execution (internal)
+  # ===========================================
+  # NOTE: On macOS, if the target site is behind IP/VPN restrictions,
+  # run the runner natively instead:  ./runner/run-native.sh
+  # Docker bridge networking uses a different outbound IP than your host.
+  runner:
+    build:
+      context: ./runner
+      dockerfile: Dockerfile
+    container_name: autotest-runner
+    # No ports exposed — accessed only via orchestrator
+    environment:
+      - PORT=8001
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ARTIFACTS_DIR=/app/artifacts
+      - PLAYWRIGHT_CHROMIUM_CHANNEL=${PLAYWRIGHT_CHROMIUM_CHANNEL:-}
+      - TESTS_STORE_ROOT=/app/tests-store
+    volumes:
+      - runner-artifacts:/app/artifacts
+      - generated-tests:/app/generated-tests
+      - tests-store:/app/tests-store
+    restart: unless-stopped
+    networks:
+      - autotest-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+  # ===========================================
+  # Registry — Account/project/key management + test approval (internal)
+  # ===========================================
+  registry:
+    build:
+      context: ./registry
+      dockerfile: Dockerfile
+    container_name: autotest-registry
+    # No ports exposed — accessed only via orchestrator
+    environment:
+      - ADMIN_BOOTSTRAP_SECRET=${ADMIN_BOOTSTRAP_SECRET:-changeme}
+      - TESTS_ROOT=/app/tests-store
+      - DATABASE_PATH=/app/registry-data/registry.db
+      - SESSION_TTL_DAYS=${SESSION_TTL_DAYS:-7}
+    volumes:
+      - tests-store:/app/tests-store
+      - registry-db:/app/registry-data
+    restart: unless-stopped
+    networks:
+      - autotest-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+
+  # ===========================================
+  # Admin UI — React admin dashboard (port 8004)
+  # ===========================================
+  admin:
+    build:
+      context: ../frontend-admin
+      dockerfile: Dockerfile
+    container_name: autotest-admin
+    ports:
+      - "${ADMIN_PORT:-8004}:80"
+    restart: unless-stopped
+    networks:
+      - autotest-network
+    depends_on:
+      - orchestrator
+
+networks:
+  autotest-network:
+    driver: bridge
+
+volumes:
+  runner-artifacts:
+    driver: local
+  generated-tests:
+    driver: local
+  tests-store:
+    driver: local
+  registry-db:
+    driver: local
+  # Uncomment for Option B (fully self-contained credentials)
+  # claude-credentials:
+  #   driver: local

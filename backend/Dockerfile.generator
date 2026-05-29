@@ -1,0 +1,50 @@
+# Autotest Generator Dockerfile
+# Runs Claude CLI + Playwright MCP inside Docker for test generation.
+#
+# Authentication:
+#   Option A (default): mount host ~/.claude/ via docker-compose volume
+#   Option B: run `docker exec -it autotest-generator claude login`
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+# Install Node.js 20.x (needed for Claude CLI and Playwright MCP)
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg && \
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI globally
+RUN npm install -g @anthropic-ai/claude-code
+
+# Install Playwright MCP globally (avoids npx re-download on each invocation)
+RUN npm install -g @playwright/mcp
+
+# Install Playwright browsers + system deps (MCP spawns headless Chromium)
+RUN npx playwright install --with-deps chromium
+
+# Copy and install Python dependencies
+COPY requirements-proxy.txt .
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements-proxy.txt
+
+# Copy generator code and MCP config
+COPY generator.py /app/backend/generator.py
+COPY .claude/ /app/backend/.claude/
+
+# Create __init__.py for the backend package
+RUN touch /app/backend/__init__.py
+
+# Create generated-tests directory
+RUN mkdir -p /app/generated-tests
+
+EXPOSE 8002
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD curl -f http://localhost:8002/health || exit 1
+
+CMD ["uvicorn", "backend.generator:app", "--host", "0.0.0.0", "--port", "8002"]

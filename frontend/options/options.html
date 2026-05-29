@@ -1,0 +1,510 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Autotest Settings</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="topbar">
+        <div>
+          <div class="title">Autotest Settings</div>
+          <div class="subtitle">Configure environments, replay, and advanced features</div>
+        </div>
+        <div class="actions">
+          <button id="resetBtn" class="btn btn--ghost" type="button">Reset</button>
+        </div>
+      </header>
+
+      <!-- Tab Navigation -->
+      <nav class="tabNav">
+        <button class="tabNav__tab tabNav__tab--active" data-tab="basic">
+          <span class="tabNav__icon">⚙️</span>
+          Basic
+        </button>
+        <button class="tabNav__tab" data-tab="capture">
+          <span class="tabNav__icon">📸</span>
+          Capture
+        </button>
+        <button class="tabNav__tab" data-tab="recordings">
+          <span class="tabNav__icon">📹</span>
+          Recordings
+          <span id="recordingsCountBadge" class="tabNav__badge">0</span>
+        </button>
+        <button class="tabNav__tab" data-tab="network">
+          <span class="tabNav__icon">🌐</span>
+          Network
+        </button>
+        <button class="tabNav__tab" data-tab="advanced">
+          <span class="tabNav__icon">🔧</span>
+          Advanced
+        </button>
+      </nav>
+
+      <main class="content">
+
+        <!-- ============================================ -->
+        <!-- Tab 1: Basic Features                        -->
+        <!-- ============================================ -->
+        <div id="basicTab" class="tabContent tabContent--active">
+
+          <!-- Environments -->
+          <div class="settingsCard">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Environments</div>
+                <div class="section__subtitle">Configure target URLs and variables for each environment</div>
+              </div>
+            </div>
+            <div class="envLayout">
+              <section class="envSidebar" aria-label="Environment list">
+                <div class="envSidebar__header">
+                  <div class="envSidebar__title">Environments</div>
+                  <button id="addEnvBtn" class="btn btn--primary" type="button">Add</button>
+                </div>
+                <div id="envList" class="envList"></div>
+                <div class="envSidebar__footer">
+                  <div class="hint">
+                    <div><b>Base URL</b> should be an absolute <span class="mono">https://</span> (or <span class="mono">http://</span>) URL.</div>
+                  </div>
+                </div>
+              </section>
+
+              <section class="envEditorWrap" aria-label="Environment editor">
+                <div id="emptyState" class="emptyState">
+                  <div class="emptyState__title">No environment selected</div>
+                  <div class="emptyState__body">Add an environment, then set its name and base URL.</div>
+                </div>
+
+                <form id="editor" class="editor" hidden>
+                  <div class="editor__header">
+                    <div>
+                      <div class="editor__title">Edit environment</div>
+                      <div id="envIdText" class="editor__subtitle mono"></div>
+                    </div>
+                    <div class="editor__actions">
+                      <button id="deleteEnvBtn" class="btn btn--danger" type="button">Delete</button>
+                      <button id="saveBtn" class="btn btn--primary" type="button">Save</button>
+                    </div>
+                  </div>
+
+                  <div id="formErrors" class="errors" hidden></div>
+
+                  <div class="grid">
+                    <label class="field">
+                      <div class="field__label">Name</div>
+                      <input id="envName" class="input" type="text" placeholder="e.g. Staging" autocomplete="off" />
+                      <div id="envNameError" class="field__error"></div>
+                    </label>
+
+                    <label class="field">
+                      <div class="field__label">App/Domain ID (optional)</div>
+                      <input id="appId" class="input" type="text" placeholder="e.g. site or admin" autocomplete="off" />
+                      <div class="field__hint">Used to route steps to the correct app during replay.</div>
+                    </label>
+
+                    <label class="field">
+                      <div class="field__label">Base URL</div>
+                      <input id="baseUrl" class="input" type="url" placeholder="e.g. https://staging.example.com" autocomplete="off" />
+                      <div class="field__hint">Normalized by trimming and removing trailing slashes.</div>
+                      <div id="baseUrlError" class="field__error"></div>
+                    </label>
+
+                    <label class="field field--wide field--row">
+                      <input id="isDefault" type="checkbox" />
+                      <div>
+                        <div class="field__label">Default environment</div>
+                        <div class="field__hint">Exactly one environment can be default.</div>
+                      </div>
+                    </label>
+                  </div>
+
+                  <div class="section">
+                    <div class="section__header">
+                      <div>
+                        <div class="section__title">Variables</div>
+                        <div class="section__subtitle mono">Use placeholders like ${VAR_NAME} or {{VAR_NAME}}</div>
+                      </div>
+                      <button id="addVarBtn" class="btn btn--ghost" type="button">Add variable</button>
+                    </div>
+
+                    <div class="tableWrap">
+                      <table class="table" aria-label="Environment variables">
+                        <thead>
+                          <tr>
+                            <th>Key</th>
+                            <th>Value</th>
+                            <th>Secret</th>
+                            <th></th>
+                          </tr>
+                        </thead>
+                        <tbody id="varsBody"></tbody>
+                      </table>
+                    </div>
+                    <div id="varsError" class="field__error"></div>
+                  </div>
+
+                  <div class="footer">
+                    <div id="status" class="status" role="status" aria-live="polite"></div>
+                  </div>
+                </form>
+              </section>
+            </div>
+          </div>
+
+          <!-- Replay Settings -->
+          <div class="settingsCard">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Replay Settings</div>
+                <div class="section__subtitle">Configure default behavior for test replay</div>
+              </div>
+            </div>
+            <div class="field">
+              <div class="field__label">Default retry count</div>
+              <input id="defaultRetryCount" class="input" type="number" min="0" max="5" step="1" value="0" style="width: 80px;" />
+              <div class="field__hint">Number of times to retry a failed replay (0 = no retries)</div>
+            </div>
+            <div class="field" style="margin-top: 12px;">
+              <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                <input id="defaultSoftAssertions" type="checkbox" />
+                <span>Enable soft assertions by default</span>
+              </label>
+              <div class="field__hint">Soft assertions log failures but don't stop the test</div>
+            </div>
+            <div class="field" style="margin-top: 12px;">
+              <div class="field__label">Viewport override</div>
+              <div style="display:flex;gap:8px;align-items:center;">
+                <input id="viewportWidth" class="input" type="number" min="320" max="3840" placeholder="Width" style="width:80px;" />
+                <span style="color:var(--muted);">×</span>
+                <input id="viewportHeight" class="input" type="number" min="240" max="2160" placeholder="Height" style="width:80px;" />
+              </div>
+              <div class="field__hint">Leave blank for default viewport. Used for mobile emulation.</div>
+            </div>
+            <div class="field" style="margin-top: 12px;">
+              <button id="saveReplaySettings" class="btn btn--primary">Save Replay Settings</button>
+              <div id="replaySettingsStatus" class="status" style="margin-top: 8px;"></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ============================================ -->
+        <!-- Tab 2: Capture                               -->
+        <!-- ============================================ -->
+        <div id="captureTab" class="tabContent">
+          <div class="settingsCard">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Screenshot & Video Capture</div>
+                <div class="section__subtitle">Configure what to capture during replay for documentation and debugging</div>
+              </div>
+            </div>
+            
+            <div class="captureSettings">
+              <label class="field field--row">
+                <input type="radio" name="captureMode" value="none" id="captureModeNone" />
+                <div>
+                  <div class="field__label">None</div>
+                  <div class="field__hint">No screenshots or video recording</div>
+                </div>
+              </label>
+
+              <label class="field field--row">
+                <input type="radio" name="captureMode" value="screenshots" id="captureModeScreenshots" />
+                <div>
+                  <div class="field__label">Screenshots Only</div>
+                  <div class="field__hint">Take a screenshot after each step during replay</div>
+                </div>
+              </label>
+
+              <label class="field field--row">
+                <input type="radio" name="captureMode" value="video" id="captureModeVideo" />
+                <div>
+                  <div class="field__label">Video Only</div>
+                  <div class="field__hint">Record the entire replay session as a video (WebM)</div>
+                </div>
+              </label>
+
+              <label class="field field--row">
+                <input type="radio" name="captureMode" value="both" id="captureModeBoth" />
+                <div>
+                  <div class="field__label">Both Screenshots & Video</div>
+                  <div class="field__hint">Capture both for comprehensive documentation</div>
+                </div>
+              </label>
+
+              <label class="field field--row" style="margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--border);">
+                <input id="captureOnFailureOnly" type="checkbox" />
+                <div>
+                  <div class="field__label">Capture on Failure Only</div>
+                  <div class="field__hint">Only capture when a replay fails. Saves storage for successful runs.</div>
+                </div>
+              </label>
+
+              <div class="field">
+                <button id="saveCaptureSettings" class="btn btn--primary">Save Capture Settings</button>
+                <div id="captureStatus" class="status" style="margin-top: 8px;"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============================================ -->
+        <!-- Tab 3: Recordings                            -->
+        <!-- ============================================ -->
+        <div id="recordingsTab" class="tabContent">
+          <div class="settingsCard">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Recordings</div>
+                <div class="section__subtitle">Saved recordings with step details for QA review</div>
+              </div>
+              <div class="recordingsActions">
+                <label class="selectAllLabel">
+                  <input type="checkbox" id="selectAllRecordings" />
+                  <span>Select All</span>
+                </label>
+                <button id="deleteSelectedBtn" class="btn btn--danger btn--small" disabled>
+                  Delete Selected (<span id="selectedCount">0</span>)
+                </button>
+              </div>
+            </div>
+            <span id="recordingsCount" style="display:none;">0</span>
+            
+            <!-- Filter/Search -->
+            <div class="recordingsFilter">
+              <input type="text" id="recordingsSearch" class="input" placeholder="Search recordings..." />
+              <select id="recordingsTypeFilter" class="input input--select">
+                <option value="all">All Recordings</option>
+                <option value="manual">Manual Recordings</option>
+                <option value="nlp">NLP Recordings</option>
+              </select>
+            </div>
+            
+            <div id="recordingsList" class="recordingsList"></div>
+          </div>
+        </div>
+
+        <!-- ============================================ -->
+        <!-- Tab: Network                                 -->
+        <!-- ============================================ -->
+        <div id="networkTab" class="tabContent">
+
+          <!-- Block Patterns -->
+          <div class="settingsCard">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Block Patterns</div>
+                <div class="section__subtitle">URL glob patterns to abort during replay. One pattern per line. Applied in both browser replay and Playwright runner.</div>
+              </div>
+            </div>
+            <div class="field" style="margin-top: 12px;">
+              <div class="field__label">Blocked URL patterns</div>
+              <div class="field__hint">Use glob wildcards: <code>**</code> matches any path segment, <code>*</code> matches within a segment.</div>
+              <textarea id="blockPatterns" class="input" rows="5" style="margin-top: 8px; font-family: monospace; font-size: 12px;" placeholder="**/analytics/**&#10;**google-tag-manager**&#10;**/hotjar/**&#10;**/segment.io/**"></textarea>
+            </div>
+          </div>
+
+          <!-- Capture Patterns -->
+          <div class="settingsCard">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Capture Patterns</div>
+                <div class="section__subtitle">URL glob patterns whose response bodies are captured during recording and stored with the recording for offline replay mocking.</div>
+              </div>
+            </div>
+            <div class="field" style="margin-top: 12px;">
+              <div class="field__label">Captured URL patterns</div>
+              <div class="field__hint">API calls matching these patterns will have their responses saved so you can replay against captured data.</div>
+              <textarea id="capturePatterns" class="input" rows="5" style="margin-top: 8px; font-family: monospace; font-size: 12px;" placeholder="**/api/**&#10;**/graphql&#10;**/v1/**&#10;**/rest/**"></textarea>
+            </div>
+          </div>
+
+          <div id="networkStatus" class="status" style="margin-top: 8px;"></div>
+          <button id="saveNetworkSettings" class="btn btn--primary" style="margin-top: 12px;">Save Network Settings</button>
+
+        </div>
+
+        <!-- ============================================ -->
+        <!-- Tab: Advanced — Account, Runner, Generator   -->
+        <!-- ============================================ -->
+        <div id="advancedTab" class="tabContent">
+
+          <!-- Backend Connection -->
+          <div class="settingsCard">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Backend Connection</div>
+                <div class="section__subtitle">Connect to the Autotest backend to enable team features, headless runner, and AI generation</div>
+              </div>
+            </div>
+
+            <div class="field" style="margin-top: 8px;">
+              <div class="field__label">Backend URL</div>
+              <input id="backendUrl" class="input" type="url" placeholder="http://localhost:8000" autocomplete="off" />
+              <div class="field__hint">URL of the Autotest backend orchestrator (single entry point for all services)</div>
+            </div>
+
+            <div id="registryLoginFields">
+              <div class="field" style="margin-top: 12px;">
+                <div class="field__label">Email</div>
+                <input id="registryEmail" class="input" type="email" placeholder="user@example.com" autocomplete="off" />
+              </div>
+
+              <div class="field" style="margin-top: 12px;">
+                <div class="field__label">Password</div>
+                <input id="registryPassword" class="input" type="password" placeholder="Password" autocomplete="off" />
+              </div>
+            </div>
+
+            <div class="field" style="margin-top: 12px;">
+              <div class="btnRow">
+                <button id="registryConnectBtn" class="btn btn--primary">Login</button>
+                <button id="registryDisconnectBtn" class="btn btn--danger" style="display:none;">Logout</button>
+              </div>
+              <div id="registryStatus" class="status" style="margin-top: 8px;"></div>
+            </div>
+
+            <!-- Connection info (shown when connected) -->
+            <div id="registryInfo" class="infoBox infoBox--green" style="margin-top: 16px; display: none;">
+              <div style="display: flex; gap: 16px; flex-wrap: wrap;">
+                <div><strong>User:</strong> <span id="registryUserName">—</span></div>
+                <div><strong>Account:</strong> <span id="registryAccountName">—</span></div>
+                <div><strong>Project:</strong> <span id="registryProjectName">—</span></div>
+                <div><strong>Role:</strong> <span id="registryRoleBadge" class="pill">—</span></div>
+              </div>
+              <!-- Account/project switcher -->
+              <div id="registryContextSwitcher" style="margin-top: 12px; display: none;">
+                <div class="field__label">Switch Account/Project</div>
+                <select id="registryContextSelect" class="input input--select" style="margin-top: 4px;"></select>
+              </div>
+            </div>
+          </div>
+
+          <!-- Admin note -->
+          <div id="adminPanel" class="settingsCard" style="display: none;">
+            <div class="field__hint" style="text-align: center; padding: 8px;">
+              For account/project/key management, use the <strong>Autotest Admin</strong> dashboard.
+            </div>
+          </div>
+
+          <!-- Test Management (visible when connected) -->
+          <div id="testManagementPanel" class="login-gated-section" style="display: none;">
+            <div class="settingsCard">
+              <div class="section__header">
+                <div>
+                  <div class="section__title">Remote Tests</div>
+                  <div class="section__subtitle">Tests stored in the registry for your project</div>
+                </div>
+                <button id="refreshTestsBtn" class="btn btn--ghost">Refresh</button>
+              </div>
+              <div id="remoteTestsList" style="margin-top: 8px;"></div>
+              <div id="remoteTestsStatus" class="status" style="margin-top: 8px;"></div>
+            </div>
+          </div>
+
+          <!-- Runner Configuration -->
+          <div id="runnerConfigCard" class="settingsCard login-gated-section">
+            <div class="section__header">
+              <div>
+                <div class="section__title">Headless Runner</div>
+                <div class="section__subtitle">Run recordings in headless Chromium, Firefox, or WebKit</div>
+              </div>
+            </div>
+
+            <div class="runnerConfigSettings">
+              <label class="field field--row">
+                <input id="runnerEnabled" type="checkbox" />
+                <div>
+                  <div class="field__label">Enable Runner</div>
+                  <div class="field__hint">When enabled, the headless replay button sends recordings to the Runner service for execution.</div>
+                </div>
+              </label>
+
+              <div id="runnerFields" style="display: none;">
+                <div class="field">
+                  <div class="btnRow">
+                    <button id="testRunnerConnection" class="btn btn--ghost">Test Connection</button>
+                    <button id="saveRunnerConfig" class="btn btn--primary">Save Configuration</button>
+                  </div>
+                  <div id="runnerConfigStatus" class="status" style="margin-top: 8px;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Generator Configuration -->
+          <div id="generatorConfigCard" class="settingsCard login-gated-section" style="display: none;">
+            <div class="section__header">
+              <div>
+                <div class="section__title">AI Test Generator</div>
+                <div class="section__subtitle">AI test generation powered by Claude CLI with Playwright MCP</div>
+              </div>
+            </div>
+
+            <label class="field field--row" style="margin-bottom: 12px;">
+              <input id="enableAllAI" type="checkbox" style="width: 20px; height: 20px;" />
+              <div>
+                <div class="field__label">Enable Generator</div>
+                <div class="field__hint">When checked, AI test generation features are available.</div>
+              </div>
+            </label>
+
+            <div id="aiConfigCard" class="ai-section">
+              <div class="field" style="margin-top: 8px;">
+                <div class="field__label">Claude Model</div>
+                <select id="aiModel" class="input">
+                  <option value="claude-opus-4-6" selected>Claude Opus 4.6</option>
+                  <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+                  <option value="claude-opus-4-20250514">Claude Opus 4</option>
+                  <option value="claude-sonnet-4-20250514">Claude Sonnet 4</option>
+                  <option value="claude-haiku-4-5-20251001">Claude Haiku 4.5</option>
+                </select>
+                <div class="field__hint">Select the Claude model to use for test generation.</div>
+              </div>
+
+              <div class="field" style="margin-top: 12px;">
+                <div class="btnRow">
+                  <button id="testGeneratorConnection" class="btn btn--ghost">Test Connection</button>
+                  <button id="saveGeneratorConfig" class="btn btn--primary">Save Configuration</button>
+                </div>
+                <div id="generatorStatus" class="status" style="margin-top: 8px;">Checking...</div>
+              </div>
+
+              <!-- Claude Login Flow -->
+              <div id="claudeLoginSection" class="infoBox infoBox--green" style="margin-top: 16px; display: none;">
+                <strong>Claude Authentication</strong>
+                <div id="claudeLoginPrompt" style="margin-top: 8px;">
+                  <p style="margin: 0 0 8px 0; font-size: 13px;">Claude CLI is not authenticated. Click below to start the login process.</p>
+                  <button id="startClaudeLogin" class="btn btn--primary">Login to Claude</button>
+                </div>
+                <div id="claudeLoginUrl" style="margin-top: 8px; display: none;">
+                  <p style="margin: 0 0 8px 0; font-size: 13px;"><strong>Step 1:</strong> Click the link below to open the login page in your browser:</p>
+                  <a id="claudeLoginLink" href="#" target="_blank" rel="noopener" style="display: inline-block; margin-top: 4px; padding: 8px 16px; background: #4CAF50; color: #fff; border-radius: 6px; text-decoration: none; font-size: 13px; font-weight: 600;">Open Claude Login Page</a>
+                  <div style="margin-top: 16px;">
+                    <p style="margin: 0 0 8px 0; font-size: 13px;"><strong>Step 2:</strong> After authenticating, copy the code shown in the browser and paste it below:</p>
+                    <div style="display: flex; gap: 8px;">
+                      <input id="claudeAuthCode" class="input" type="text" placeholder="Paste authorization code here..." style="flex: 1;" />
+                      <button id="submitClaudeCode" class="btn btn--primary">Submit Code</button>
+                    </div>
+                  </div>
+                </div>
+                <div id="claudeLoginStatus" class="status" style="margin-top: 8px;"></div>
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+        <div class="footer">
+          <div id="pageStatus" class="status" role="status" aria-live="polite"></div>
+        </div>
+      </main>
+    </div>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

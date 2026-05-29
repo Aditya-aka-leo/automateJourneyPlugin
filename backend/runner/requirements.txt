@@ -1,0 +1,18 @@
+# Playwright Runner Service
+# Python 3.11+ required
+
+# Web Framework
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+
+# Pydantic for data validation
+pydantic>=2.5.0
+
+# Playwright browser automation
+playwright==1.58.0
+
+# Async support
+aiofiles>=23.2.0
+
+# Logging
+loguru>=0.7.2

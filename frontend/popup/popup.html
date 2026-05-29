@@ -1,0 +1,550 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Autotest</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <div class="app">
+      <div class="header">
+        <div class="header-row">
+          <div class="header-title">
+            <svg class="header-logo" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 17 10 11 4 5"></polyline>
+              <line x1="12" y1="19" x2="20" y2="19"></line>
+            </svg>
+            <span class="title">Autotest</span>
+          </div>
+          <div class="header-actions">
+            <!-- Overlay mode selector: HUD or Side Panel (mutually exclusive) -->
+            <div class="overlay-mode-group">
+              <button id="overlayHudBtn" class="overlay-mode-btn" type="button" title="Open as HUD overlay">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+              </button>
+              <button id="overlaySidePanelBtn" class="overlay-mode-btn" type="button" title="Pin to Side Panel">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="15" y1="3" x2="15" y2="21"/></svg>
+              </button>
+            </div>
+            <button id="openOptions" class="btn-icon" type="button" title="Settings">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mode header (shown during active modes, hidden on home) -->
+      <div id="modeHeader" class="mode-header">
+        <div class="mode-header__info">
+          <div id="modeStatusDot" class="status-dot status-dot--running"></div>
+          <span id="modeStatusText">Working...</span>
+        </div>
+        <span id="modeStepCount" class="mode-header__count"></span>
+        <button id="clearModeBtn" class="mode-header__clear" type="button" style="display:none;">Clear</button>
+        <button id="backToHomeBtn" class="mode-header__back btn-icon btn-icon--xs" type="button" title="Back to Home">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M6 9.5V21h12V9.5"/><path d="M10 21v-6h4v6"/></svg>
+        </button>
+      </div>
+
+      <!-- Registry connection bar -->
+      <div id="registryBar" class="registry-bar">
+        <!-- Connected state -->
+        <div id="registryConnected" class="registry-connected" style="display:none;">
+          <span class="registry-dot registry-dot--on"></span>
+          <span id="registryBarText" class="registry-bar__text"></span>
+          <span id="registryBarRole" class="registry-bar__role"></span>
+          <button id="registryBarDisconnect" class="btn-icon btn-icon--xs" type="button" title="Disconnect">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+        <!-- Disconnected state (click to expand config) -->
+        <div id="registryDisconnected" class="registry-disconnected">
+          <button id="registryToggleConfig" class="registry-connect-btn" type="button">
+            <span class="registry-dot registry-dot--off"></span>
+            <span>Connect to Registry</span>
+          </button>
+        </div>
+        <!-- Expandable config panel -->
+        <div id="registryConfigPanel" class="registry-config-panel" style="display:none;">
+          <div class="registry-config-field">
+            <label class="registry-config-label">Backend URL</label>
+            <input id="popupRegistryUrl" class="input input--sm" type="url" placeholder="http://localhost:8000" />
+          </div>
+          <div class="registry-config-field">
+            <label class="registry-config-label">Email</label>
+            <input id="popupRegistryEmail" class="input input--sm" type="email" placeholder="user@example.com" />
+          </div>
+          <div class="registry-config-field">
+            <label class="registry-config-label">Password</label>
+            <input id="popupRegistryPassword" class="input input--sm" type="password" placeholder="Password" />
+          </div>
+          <div class="registry-config-actions">
+            <button id="popupRegistryConnect" class="btn btn--primary btn--xs" type="button">Login</button>
+            <button id="popupRegistryCancel" class="btn btn--ghost btn--xs" type="button">Cancel</button>
+          </div>
+          <div id="popupRegistryStatus" class="registry-config-status"></div>
+        </div>
+      </div>
+
+      <!-- Home grid — 4 main action buttons (visible only on home screen) -->
+      <div class="home-grid">
+        <button id="homeRecordBtn" class="home-btn home-btn--record" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
+          <span>Record</span>
+          <span id="homeRecordStatus" class="home-btn__status"></span>
+        </button>
+        <button id="homeGenerateBtn" class="home-btn home-btn--generate ai-gated login-gated" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2a10 10 0 1 0 10 10H12V2z"/><path d="M20 12A8 8 0 0 0 12 4v8z"/></svg>
+          <span>Generate</span>
+          <span id="homeGenerateStatus" class="home-btn__status"></span>
+        </button>
+        <button id="homeReplayBtn" class="home-btn home-btn--replay" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          <span>Replay</span>
+          <span id="homeReplayStatus" class="home-btn__status"></span>
+        </button>
+        <button id="homeHeadlessBtn" class="home-btn home-btn--headless login-gated" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><polygon points="9.5 7 9.5 13 14.5 10" fill="currentColor" stroke="none"/></svg>
+          <span>Headless</span>
+          <span id="homeHeadlessStatus" class="home-btn__status"></span>
+        </button>
+      </div>
+
+      <!-- Selectors row -->
+      <div class="selector-row">
+        <div class="selector-group">
+          <label class="selector-label" for="envSelect">Env</label>
+          <select id="envSelect" class="select" aria-label="Environment selection"></select>
+        </div>
+        <div class="selector-group selector-group--wide">
+          <label class="selector-label" for="recordingSelect">Recording</label>
+          <select id="recordingSelect" class="select" aria-label="Recording selection"></select>
+        </div>
+      </div>
+      <div id="envHint" class="hint"></div>
+      <div id="recordingHint" class="hint"></div>
+
+      <!-- Capture Mode: icon strip -->
+      <div class="capture-strip">
+        <div class="capture-strip__modes">
+          <label class="capture-chip" title="No capture">
+            <input type="radio" name="captureMode" value="none" id="captureNone" />
+            <span class="capture-chip__inner">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+              <span class="capture-chip__text">Off</span>
+            </span>
+          </label>
+          <label class="capture-chip" title="Screenshots">
+            <input type="radio" name="captureMode" value="screenshots" id="captureScreenshots" />
+            <span class="capture-chip__inner">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>
+              <span class="capture-chip__text">Photo</span>
+            </span>
+          </label>
+          <label class="capture-chip" title="Video">
+            <input type="radio" name="captureMode" value="video" id="captureVideo" />
+            <span class="capture-chip__inner">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="15" height="16" rx="2"/><path d="m22 7-5 3 5 3z"/></svg>
+              <span class="capture-chip__text">Video</span>
+            </span>
+          </label>
+          <label class="capture-chip" title="Both screenshots &amp; video">
+            <input type="radio" name="captureMode" value="both" id="captureBoth" />
+            <span class="capture-chip__inner">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="15" height="16" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m22 7-5 3 5 3z"/></svg>
+              <span class="capture-chip__text">Both</span>
+            </span>
+          </label>
+        </div>
+        <label class="capture-failure-toggle" title="Capture only on failure">
+          <input type="checkbox" id="captureOnFailureOnly" />
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+          <span>Fail only</span>
+        </label>
+      </div>
+
+      <!-- Network Filters Section -->
+      <div id="networkFiltersSection" class="nf-section">
+        <button id="nfToggleBtn" class="nf-toggle-btn" type="button">
+          <svg class="nf-chevron" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.2s;flex-shrink:0;"><polyline points="6 9 12 15 18 9"/></svg>
+          <span class="nf-toggle-label">Network Filters</span>
+          <span id="nfBlockBadge" class="nf-badge nf-badge--block" style="display:none;"></span>
+          <span id="nfCaptureBadge" class="nf-badge nf-badge--capture" style="display:none;"></span>
+        </button>
+        <div id="nfBody" class="nf-body" style="display:none;">
+          <div class="nf-group">
+            <div class="nf-group-row">
+              <span class="nf-group-title">Block Patterns</span>
+              <span class="nf-scope-hint">record · replay · generate · headless</span>
+              <label class="nf-switch" title="Enable URL blocking">
+                <input type="checkbox" id="blockPatternsEnabled" />
+                <span class="nf-switch-slider"></span>
+              </label>
+            </div>
+            <textarea id="blockPatternsInput" class="nf-textarea" rows="3" placeholder="**/analytics/**&#10;**/tracking/**&#10;**/ads/**" spellcheck="false"></textarea>
+          </div>
+          <div class="nf-group">
+            <div class="nf-group-row">
+              <span class="nf-group-title">Capture &amp; Mock Patterns</span>
+              <span class="nf-scope-hint">record → replay mock</span>
+              <label class="nf-switch" title="Capture API responses during recording, replay as mocks">
+                <input type="checkbox" id="capturePatternsEnabled" />
+                <span class="nf-switch-slider"></span>
+              </label>
+            </div>
+            <textarea id="capturePatternsInput" class="nf-textarea" rows="3" placeholder="**/api/**&#10;**/data/**" spellcheck="false"></textarea>
+          </div>
+        </div>
+      </div>
+
+      <!-- Primary actions -->
+      <div class="actions-primary">
+        <button id="recordBtn" class="btn btn--record" type="button">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
+          Record
+        </button>
+        <button id="assertModeBtn" class="btn btn--assert" type="button" title="Toggle assert mode — click page elements to add assertions" style="display:none;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          Assert
+        </button>
+        <button id="generateWithAIBtn" class="btn btn--ai ai-gated login-gated" type="button" title="Generate test with AI">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2a10 10 0 1 0 10 10H12V2z"/><path d="M20 12A8 8 0 0 0 12 4v8z"/></svg>
+          Generate
+        </button>
+        <button id="replayBtn" class="btn btn--replay" type="button">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Replay
+        </button>
+        <button id="replayHeadlessBtn" class="btn btn--replay login-gated" type="button" title="Run headless via Playwright">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/><polygon points="9.5 7 9.5 13 14.5 10" fill="currentColor" stroke="none"/></svg>
+          Headless
+        </button>
+        <button id="stopReplayBtn" class="btn btn--danger" type="button" style="display:none;" title="Stop replay">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+          Stop
+        </button>
+      </div>
+
+      <!-- Captured mocks toggle (shown when recording has captured responses) -->
+      <div id="capturedMocksRow" style="display:none; margin:4px 0; padding:4px 0;">
+        <label style="display:flex; align-items:center; gap:6px; font-size:11px; color:var(--text-secondary); cursor:pointer;">
+          <input type="checkbox" id="useCapturedMocks" style="width:13px;height:13px;flex-shrink:0;" />
+          <span>Use captured mocks (<span id="capturedResponseCount">0</span> responses)</span>
+        </label>
+      </div>
+
+      <!-- AI Prompt (inline, shown when Generate is clicked) -->
+      <div id="aiPromptSection" class="ai-prompt-section ai-gated login-gated" style="display:none;">
+        <div class="ai-prompt-container">
+          <div class="ai-prompt-body">
+            <textarea id="aiPromptInput" class="ai-prompt-textarea" rows="1" placeholder="Describe your test scenario..."></textarea>
+            <button id="generateTestBtn" class="ai-prompt-send" type="button" title="Generate Test">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg>
+            </button>
+          </div>
+          <div class="ai-prompt-hints">
+            <button class="ai-hint-chip" type="button" data-hint="Test the login flow with valid and invalid credentials">Login flow</button>
+            <button class="ai-hint-chip" type="button" data-hint="Verify form validation shows correct error messages">Form validation</button>
+            <button class="ai-hint-chip" type="button" data-hint="Navigate through main pages and verify they load correctly">Nav check</button>
+          </div>
+          <!-- Generation mode selector -->
+          <div class="ai-gen-mode-row" style="display:flex;gap:4px;margin-top:6px;">
+            <button class="ai-gen-mode-btn active" id="genModeFast" data-mode="fast" title="Generate only — quick, no validation" style="padding:3px 10px;border:1px solid #7c5cff;border-radius:12px;background:#7c5cff;color:#fff;font-size:10px;cursor:pointer;">⚡ Fast</button>
+            <button class="ai-gen-mode-btn" id="genModeReasoning" data-mode="reasoning" title="Generate + validate + auto-fix — produces verified tests" style="padding:3px 10px;border:1px solid #ccc;border-radius:12px;background:transparent;color:#666;font-size:10px;cursor:pointer;">🔬 Reasoning</button>
+          </div>
+          <div class="ai-prompt-spinner" style="display:none;">
+            <div class="ai-spinner"></div>
+            <span>Generating test with Claude...</span>
+          </div>
+          <!-- Live generation details -->
+          <div id="aiGenDetails" class="ai-gen-details" style="display:none;">
+            <div id="aiGenTarget" class="ai-gen-detail-row"></div>
+            <div id="aiGenPrompt" class="ai-gen-detail-row"></div>
+            <div id="aiGenTimer" class="ai-gen-detail-row"></div>
+            <div id="aiGenLog" class="ai-gen-log" style="display:none;"></div>
+          </div>
+          <!-- Result summary after generation -->
+          <div id="aiGenResult" class="ai-gen-result" style="display:none;"></div>
+          <div id="aiTestStatus" class="status-text" style="margin-top: 4px;"></div>
+          <div id="aiModelIndicator" style="font-size: 11px; color: #888; margin-top: 2px;"></div>
+        </div>
+      </div>
+
+      <!-- Playwright Runner Panel (hidden by default, shown by Headless button) -->
+      <div class="card card--compact login-gated" id="playwrightPanel" style="display:none;">
+        <div class="label">
+          <span>Playwright Runner</span>
+          <button id="playwrightPanelClose" class="btn-icon btn-icon--sm" type="button" title="Close">&times;</button>
+        </div>
+        <div class="pw-config">
+          <div class="pw-field">
+            <span class="pw-field-label">Browsers</span>
+            <div class="pw-chip-group" id="pwBrowserGroup">
+              <label class="pw-chip"><input type="checkbox" value="chromium" checked /><span>Chromium</span></label>
+              <label class="pw-chip"><input type="checkbox" value="firefox" /><span>Firefox</span></label>
+              <label class="pw-chip"><input type="checkbox" value="webkit" /><span>WebKit</span></label>
+            </div>
+          </div>
+          <div class="pw-field">
+            <span class="pw-field-label">Devices</span>
+            <div class="pw-chip-group" id="pwDeviceGroup">
+              <label class="pw-chip pw-chip--active"><input type="checkbox" value="" checked /><span>Desktop</span></label>
+              <label class="pw-chip"><input type="checkbox" value="iPhone 14" /><span>iPhone 14</span></label>
+              <label class="pw-chip"><input type="checkbox" value="iPhone 14 Pro Max" /><span>iPhone 14 Pro Max</span></label>
+              <label class="pw-chip"><input type="checkbox" value="Pixel 7" /><span>Pixel 7</span></label>
+              <label class="pw-chip"><input type="checkbox" value="iPad Mini" /><span>iPad Mini</span></label>
+              <label class="pw-chip"><input type="checkbox" value="Galaxy S9+" /><span>Galaxy S9+</span></label>
+            </div>
+          </div>
+          <div class="pw-toggles">
+            <label class="pw-toggle" title="Record execution trace (viewable in trace.playwright.dev)">
+              <input type="checkbox" id="pwTrace" />
+              <span>Trace</span>
+            </label>
+            <label class="pw-toggle" title="Record video of execution">
+              <input type="checkbox" id="pwVideo" />
+              <span>Video</span>
+            </label>
+            <label class="pw-toggle" title="Record network traffic as HAR file">
+              <input type="checkbox" id="pwHAR" />
+              <span>HAR</span>
+            </label>
+            <label class="pw-toggle" title="Capture per-step screenshots">
+              <input type="checkbox" id="pwScreenshots" checked />
+              <span>Screenshots</span>
+            </label>
+            <label class="pw-toggle" title="Live screencast of test execution (first combo only)">
+              <input type="checkbox" id="pwLiveFeed" checked />
+              <span>Live Feed</span>
+            </label>
+          </div>
+          <details class="pw-advanced">
+            <summary class="pw-advanced-summary">Advanced options</summary>
+            <div class="pw-advanced-body">
+              <label class="pw-field">
+                <span class="pw-field-label">Timezone</span>
+                <input type="text" id="pwTimezone" class="input input--sm" placeholder="e.g. America/New_York" />
+              </label>
+              <label class="pw-field">
+                <span class="pw-field-label">Locale</span>
+                <input type="text" id="pwLocale" class="input input--sm" placeholder="e.g. en-US" />
+              </label>
+              <div class="pw-row">
+                <label class="pw-field">
+                  <span class="pw-field-label">Geo Latitude</span>
+                  <input type="number" id="pwGeoLat" class="input input--sm" step="0.0001" placeholder="37.7749" />
+                </label>
+                <label class="pw-field">
+                  <span class="pw-field-label">Geo Longitude</span>
+                  <input type="number" id="pwGeoLon" class="input input--sm" step="0.0001" placeholder="-122.4194" />
+                </label>
+              </div>
+              <label class="pw-field">
+                <span class="pw-field-label">Network Mocks (JSON)</span>
+                <textarea id="pwNetworkMocks" class="input input--sm pw-textarea" rows="3" placeholder='[{"url":"**/api/users","response":{"status":200,"body":[]}}]'></textarea>
+              </label>
+            </div>
+          </details>
+          <label class="pw-field" style="flex-direction:row; align-items:center; gap:8px; margin-top:4px;">
+            <input type="checkbox" id="pwUseCapturedMocks" style="width:14px;height:14px;flex-shrink:0;" />
+            <span class="pw-field-label" style="margin:0;">Use captured mocks <span id="pwCapturedCount" style="color:var(--text-secondary);">(0 responses)</span></span>
+          </label>
+          <div class="pw-actions">
+            <button id="pwRunBtn" class="btn btn--primary btn--sm" type="button">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+              Run on Playwright
+            </button>
+            <button id="pwStopBtn" class="btn btn--danger btn--sm" type="button" style="display:none;">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+              Stop Run
+            </button>
+          </div>
+        </div>
+        <div id="pwStatus" class="status-text" style="margin-top:6px;"></div>
+        <div id="pwLiveView" style="display:none; margin-top:8px; border-radius:4px; overflow:hidden; background:#000; line-height:0;">
+          <img id="pwLiveFrame" style="width:100%; display:block;" alt="" />
+        </div>
+        <div id="pwResults" style="display:none; margin-top:8px;"></div>
+        <button id="pwRerunBtn" class="btn btn--primary btn--sm" type="button" style="display:none; margin-top:8px;">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+          Rerun
+        </button>
+      </div>
+
+      <!-- Replay controls (shown only during replay) -->
+      <div id="replayControlsBar" class="replay-controls-bar" style="display:none;">
+        <button id="startReplayBtn" class="replay-ctrl-btn replay-ctrl-btn--start" type="button" title="Start replay">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          <span>Start Replay</span>
+        </button>
+        <button id="pauseReplayBtn" class="replay-ctrl-btn" type="button" title="Pause replay">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="8" y1="5" x2="8" y2="19"/><line x1="16" y1="5" x2="16" y2="19"/></svg>
+          <span>Pause</span>
+        </button>
+        <button id="resumeReplayBtn" class="replay-ctrl-btn replay-ctrl-btn--resume" type="button" title="Resume replay" style="display:none;">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          <span>Resume</span>
+        </button>
+        <button id="stopReplayBtn2" class="replay-ctrl-btn replay-ctrl-btn--stop" type="button" title="Stop replay">
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+          <span>Stop</span>
+        </button>
+      </div>
+
+      <!-- Step Editor Panel (hidden by default, shown on edit click) -->
+      <div id="stepEditorPanel" class="step-editor-panel" style="display:none;">
+        <div class="step-editor-header">
+          <span class="step-editor-title">Edit Step <span id="stepEditorIdx"></span></span>
+          <button id="stepEditorClose" class="btn-icon btn-icon--sm" type="button" title="Close">&times;</button>
+        </div>
+        <div class="step-editor-fields">
+          <label class="step-editor-field">
+            <span class="step-editor-field-label">Name</span>
+            <input type="text" id="stepEditorName" class="step-editor-input" placeholder="Custom step name" />
+          </label>
+          <label class="step-editor-field">
+            <span class="step-editor-field-label">Type</span>
+            <select id="stepEditorType" class="step-editor-input">
+              <optgroup label="Actions">
+                <option value="click">click</option>
+                <option value="input">input</option>
+                <option value="change">change</option>
+                <option value="submit">submit</option>
+                <option value="navigation">navigation</option>
+                <option value="scroll">scroll</option>
+                <option value="select">select</option>
+                <option value="hover">hover</option>
+                <option value="key">keyboard</option>
+                <option value="upload">file upload</option>
+                <option value="drag_drop">drag & drop</option>
+              </optgroup>
+              <optgroup label="Assertions">
+                <option value="assert_exists">assert: element exists</option>
+                <option value="assert_visible">assert: is visible</option>
+                <option value="assert_hidden">assert: is hidden</option>
+                <option value="assert_text_equals">assert: text equals</option>
+                <option value="assert_text_contains">assert: text contains</option>
+                <option value="assert_attr_equals">assert: attribute equals</option>
+                <option value="assert_url_contains">assert: URL contains</option>
+                <option value="assert_checked">assert: is checked</option>
+                <option value="assert_disabled">assert: is disabled</option>
+                <option value="assert_enabled">assert: is enabled</option>
+                <option value="assert_has_class">assert: has class</option>
+                <option value="assert_has_value">assert: has value</option>
+                <option value="assert_has_title">assert: page title</option>
+                <option value="assert_count">assert: element count</option>
+                <option value="assert_editable">assert: is editable</option>
+                <option value="assert_no_console_errors">assert: no console errors</option>
+                <option value="assert_screenshot">assert: screenshot match</option>
+              </optgroup>
+              <optgroup label="Waits">
+                <option value="wait_delay">wait: delay (ms)</option>
+                <option value="wait_for_url">wait: URL contains</option>
+                <option value="wait_for_text">wait: text appears</option>
+                <option value="waitForElement">wait: element appears</option>
+                <option value="waitForNavigation">wait: navigation</option>
+              </optgroup>
+              <optgroup label="Control Flow">
+                <option value="if_exists">if: element exists</option>
+                <option value="if_not_exists">if: element not exists</option>
+                <option value="end_if">end if</option>
+                <option value="loop_start">loop start (N times)</option>
+                <option value="loop_end">loop end</option>
+              </optgroup>
+            </select>
+          </label>
+          <label class="step-editor-field" id="stepEditorAttrField" style="display:none;">
+            <span class="step-editor-field-label">Attribute</span>
+            <input type="text" id="stepEditorAttr" class="step-editor-input step-editor-input--mono" placeholder="e.g. href, data-id, aria-label" />
+          </label>
+          <label class="step-editor-field">
+            <span class="step-editor-field-label">Value</span>
+            <input type="text" id="stepEditorValue" class="step-editor-input" placeholder="Step value (for input/change)" />
+          </label>
+          <label class="step-editor-field">
+            <span class="step-editor-field-label">Selector</span>
+            <input type="text" id="stepEditorSelector" class="step-editor-input step-editor-input--mono" placeholder="CSS selector or XPath" />
+          </label>
+          <label class="step-editor-field">
+            <span class="step-editor-field-label">Timeout (ms)</span>
+            <input type="number" id="stepEditorTimeout" class="step-editor-input" placeholder="Default: 4000" min="500" step="500" />
+          </label>
+          <label class="step-editor-field" id="stepEditorSoftField" style="display:none;">
+            <span class="step-editor-field-label">Soft assertion</span>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+              <input type="checkbox" id="stepEditorSoft" />
+              <span style="font-size:11px;color:#94a3b8;">Continue on failure (don't stop the test)</span>
+            </label>
+          </label>
+        </div>
+        <div class="step-editor-actions">
+          <button id="stepEditorSave" class="btn btn--primary btn--sm" type="button">Save</button>
+          <button id="stepEditorDelete" class="btn btn--danger-text btn--sm" type="button">Delete Step</button>
+          <button id="stepEditorCancel" class="btn btn--ghost btn--sm" type="button">Cancel</button>
+        </div>
+      </div>
+
+      <!-- Completion card (shown when a mode finishes) -->
+      <div id="completionCard" class="completion-card">
+        <div id="completionIcon" class="completion-card__icon"></div>
+        <div id="completionMsg" class="completion-card__msg"></div>
+        <div id="completionDetails" class="completion-card__details"></div>
+      </div>
+
+      <!-- Status -->
+      <div class="status-bar">
+        <div id="statusBadge" class="status-dot status-dot--idle"></div>
+        <div id="status" class="status-text">Idle</div>
+      </div>
+
+      <!-- Artifacts -->
+      <div id="artifactsCard" class="card card--compact" style="display:none;">
+        <div class="label">Artifacts</div>
+        <div id="artifactsList" class="artifacts-list"></div>
+      </div>
+
+      <!-- Steps -->
+      <div class="card card--compact steps-card">
+        <div class="label steps-header">
+          <div class="steps-tab-bar">
+            <button class="steps-tab steps-tab--active" id="mainTabSteps" type="button">Steps</button>
+            <button class="steps-tab" id="mainTabCode" type="button">Code</button>
+          </div>
+          <span class="steps-toolbar">
+            <button id="addAssertionBtn" class="btn-icon-text btn-icon-text--xs" type="button" title="Add an assertion step">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+              Assert
+            </button>
+            <button id="pushToRegistryBtn" class="btn-icon-text btn-icon-text--xs" type="button" title="Push to Registry" style="display:none;">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              Push
+            </button>
+            <button id="exportPlaywrightBtn" class="btn-icon-text btn-icon-text--xs" type="button" title="Export as Playwright test script">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Export
+            </button>
+            <button id="viewReportBtn" class="btn-icon-text btn-icon-text--xs" type="button" title="View last test report" style="display:none;">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              Report
+            </button>
+            <button id="runAllBtn" class="btn-icon-text btn-icon-text--xs" type="button" title="Run all recordings sequentially">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polygon points="5 3 19 12 5 21"/></svg>
+              Run
+            </button>
+            <button id="saveStorageStateBtn" class="btn-icon-text btn-icon-text--xs" type="button" title="Save auth/session state for reuse">
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/></svg>
+              Save
+            </button>
+          </span>
+        </div>
+        <div id="stepsList" class="stepsList"></div>
+        <div id="mainCodeView" class="main-code-view" style="display:none;">
+          <pre id="mainCodeViewer" class="code-viewer" contenteditable="true" spellcheck="false"></pre>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

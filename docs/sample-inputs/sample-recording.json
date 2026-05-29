@@ -1,0 +1,66 @@
+{
+  "name": "Login with valid credentials",
+  "description": "Tests the login flow on a sample web application",
+  "version": 1,
+  "createdAt": "2026-03-19T14:30:00Z",
+  "baseUrl": "https://example.com",
+  "steps": [
+    {
+      "type": "navigation",
+      "url": "https://example.com/login",
+      "description": "Navigate to the login page"
+    },
+    {
+      "type": "assert_visible",
+      "selector": "form[action='/login']",
+      "fallbacks": ["#login-form", "[data-testid='login-form']"],
+      "description": "Verify login form is visible"
+    },
+    {
+      "type": "input",
+      "selector": "input[name='email']",
+      "fallbacks": ["#email", "[placeholder='Email address']", "[type='email']"],
+      "value": "user@example.com",
+      "description": "Enter email address"
+    },
+    {
+      "type": "input",
+      "selector": "input[name='password']",
+      "fallbacks": ["#password", "[placeholder='Password']", "[type='password']"],
+      "value": "Password123",
+      "description": "Enter password"
+    },
+    {
+      "type": "click",
+      "selector": "button[type='submit']",
+      "fallbacks": ["text=Sign In", "text=Log In", "[data-testid='login-button']"],
+      "description": "Click the Sign In button"
+    },
+    {
+      "type": "wait_for_url",
+      "value": "/dashboard",
+      "timeout": 10000,
+      "description": "Wait for redirect to dashboard"
+    },
+    {
+      "type": "assert_url_contains",
+      "value": "/dashboard",
+      "description": "Verify URL contains /dashboard"
+    },
+    {
+      "type": "assert_visible",
+      "selector": "[data-testid='welcome-message']",
+      "fallbacks": [".welcome-banner", "text=Welcome", "h1"],
+      "description": "Verify welcome message is visible on dashboard"
+    }
+  ],
+  "config": {
+    "browser": "chromium",
+    "viewport": { "width": 1280, "height": 720 },
+    "timeout": 30000,
+    "retries": 1,
+    "softAssertions": true,
+    "captureScreenshots": true,
+    "captureVideo": false
+  }
+}

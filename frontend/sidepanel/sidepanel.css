@@ -1,0 +1,60 @@
+/*
+ * Side Panel overrides — loaded AFTER popup.css to adapt layout
+ * for the persistent, full-height side panel context.
+ */
+
+/* Remove fixed popup width; Chrome controls side panel width */
+.sidepanel-mode {
+  width: 100% !important;
+  height: 100vh;
+  max-height: none;
+  overflow-y: auto;
+}
+
+/* Show side-panel-only elements only in side panel */
+.sidepanel-mode .sidepanel-only {
+  display: inline-flex;
+}
+
+/* Hide popup-only elements in side panel */
+.sidepanel-mode .popup-only {
+  display: none !important;
+}
+
+/* Close button in side panel has red-ish hover */
+.sidepanel-mode #unpinBtn:hover {
+  background: rgba(255, 77, 77, 0.1);
+  color: #ff4d4d;
+  border-color: rgba(255, 77, 77, 0.4);
+}
+
+/* Taller scrollable areas in side panel */
+.sidepanel-mode .stepsList {
+  max-height: 600px;
+}
+.sidepanel-mode #nlStepsList {
+  max-height: 300px;
+}
+.sidepanel-mode #parsedStepsList {
+  max-height: 200px;
+}
+
+/* NL input gets more room */
+.sidepanel-mode .nl-input {
+  min-height: 120px;
+}
+
+/* Slightly more breathing room */
+.sidepanel-mode .app {
+  padding: 14px;
+  gap: 10px;
+}
+.sidepanel-mode .card {
+  padding: 12px;
+}
+
+/* Scrollbar */
+.sidepanel-mode::-webkit-scrollbar { width: 5px; }
+.sidepanel-mode::-webkit-scrollbar-track { background: transparent; }
+.sidepanel-mode::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.sidepanel-mode::-webkit-scrollbar-thumb:hover { background: var(--muted); }

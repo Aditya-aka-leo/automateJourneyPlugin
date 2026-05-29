@@ -1,0 +1,105 @@
+{
+  "_comment": "Sample configurations for headless Playwright execution via the Runner API (:8001/run)",
+
+  "basic_chromium_desktop": {
+    "description": "Default headless run on Chromium with desktop viewport",
+    "config": {
+      "browser": "chromium",
+      "device": "Desktop",
+      "viewport": { "width": 1280, "height": 720 },
+      "baseUrl": "https://example.com",
+      "trace": true,
+      "video": false,
+      "har": false,
+      "screenshots": true
+    }
+  },
+
+  "multi_browser_parallel": {
+    "description": "Run the same test across Chromium, Firefox, and WebKit in parallel",
+    "tests": [
+      {
+        "config": { "browser": "chromium", "device": "Desktop", "viewport": { "width": 1280, "height": 720 } }
+      },
+      {
+        "config": { "browser": "firefox", "device": "Desktop", "viewport": { "width": 1280, "height": 720 } }
+      },
+      {
+        "config": { "browser": "webkit", "device": "Desktop", "viewport": { "width": 1280, "height": 720 } }
+      }
+    ],
+    "max_workers": 3
+  },
+
+  "mobile_emulation": {
+    "description": "Run on mobile viewport with device emulation",
+    "config": {
+      "browser": "chromium",
+      "device": "Mobile",
+      "viewport": { "width": 375, "height": 812 },
+      "baseUrl": "https://example.com",
+      "trace": true,
+      "video": true,
+      "screenshots": true,
+      "userAgent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15"
+    }
+  },
+
+  "full_artifacts": {
+    "description": "Capture all artifacts: trace, video, HAR, and screenshots",
+    "config": {
+      "browser": "chromium",
+      "device": "Desktop",
+      "viewport": { "width": 1920, "height": 1080 },
+      "baseUrl": "https://example.com",
+      "trace": true,
+      "video": true,
+      "har": true,
+      "screenshots": true,
+      "timeout": 60000
+    }
+  },
+
+  "with_geolocation": {
+    "description": "Run with geolocation spoofing (e.g., for location-based features)",
+    "config": {
+      "browser": "chromium",
+      "device": "Desktop",
+      "viewport": { "width": 1280, "height": 720 },
+      "baseUrl": "https://example.com",
+      "geolocation": { "latitude": 37.7749, "longitude": -122.4194 },
+      "permissions": ["geolocation"],
+      "timezone": "America/Los_Angeles",
+      "locale": "en-US"
+    }
+  },
+
+  "with_network_mocks": {
+    "description": "Run with mocked API responses",
+    "config": {
+      "browser": "chromium",
+      "device": "Desktop",
+      "viewport": { "width": 1280, "height": 720 },
+      "baseUrl": "https://example.com"
+    },
+    "network_mocks": [
+      {
+        "url_pattern": "**/api/users",
+        "method": "GET",
+        "response": {
+          "status": 200,
+          "body": { "users": [{ "id": 1, "name": "Test User" }] },
+          "headers": { "content-type": "application/json" }
+        }
+      },
+      {
+        "url_pattern": "**/api/auth/login",
+        "method": "POST",
+        "response": {
+          "status": 200,
+          "body": { "token": "mock-jwt-token", "user": { "id": 1, "email": "test@example.com" } }
+        }
+      }
+    ]
+  }
+}
