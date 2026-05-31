@@ -3283,6 +3283,7 @@ chrome.runtime.onMessage.addListener((message, _sender, _sendResponse) => {
       refreshRecordedSteps(); // Refresh to show the newly added assertion
     }
   }
+
   return false; // This listener never sends a response
 });
 
