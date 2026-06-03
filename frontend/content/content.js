@@ -3091,7 +3091,8 @@ async function performStep(step) {
     
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    
+    el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+
     // Wait for DOM to stabilize, but don't fail if it doesn't
     const postDom = await waitForDOMStable();
     if (!postDom.ok) {
