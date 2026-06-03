@@ -2005,7 +2005,7 @@ async function waitForDOMStable({
   stableMs = DEFAULT_WAIT.domStableMs,
   timeoutMs = DEFAULT_WAIT.domStableTimeoutMs
 } = {}) {
-  let lastMutation = performance.now();
+  let lastMutation = performance.now() - stableMs; // treat as already stable until a mutation fires
   const observer = new MutationObserver(() => {
     lastMutation = performance.now();
   });
