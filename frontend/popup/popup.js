@@ -73,6 +73,13 @@ const els = {
   replayHeadlessBtn: document.getElementById("replayHeadlessBtn"),
   aiPromptSpinner: document.querySelector(".ai-prompt-spinner"),
   aiPromptContainer: document.querySelector(".ai-prompt-container"),
+  // Cross-tab recording prompt
+  crossTabPromptBanner: document.getElementById("crossTabPromptBanner"),
+  crossTabPromptDomain: document.getElementById("crossTabPromptDomain"),
+  confirmRecordTabBtn: document.getElementById("confirmRecordTabBtn"),
+  dismissPromptBtn: document.getElementById("dismissPromptBtn"),
+  // Discard recording button
+  discardRecordingBtn: document.getElementById("discardRecordingBtn"),
   // Overlay mode
   overlayHudBtn: document.getElementById("overlayHudBtn"),
   overlaySidePanelBtn: document.getElementById("overlaySidePanelBtn"),
@@ -289,6 +296,7 @@ function setUIMode(mode) {
   if (els.stopReplayBtn) els.stopReplayBtn.style.display = '';
   if (els.aiGenDetails) els.aiGenDetails.style.display = '';
   if (els.aiGenResult) els.aiGenResult.style.display = '';
+  if (els.discardRecordingBtn) els.discardRecordingBtn.style.display = 'none';
 
   switch (mode) {
     case 'home':
@@ -302,6 +310,7 @@ function setUIMode(mode) {
       setModeState('recording', 'running', 'Recording...');
       hideReplayControls();
       if (els.assertModeBtn) els.assertModeBtn.style.display = '';
+      if (els.discardRecordingBtn) els.discardRecordingBtn.style.display = '';
       updateModeHeader('Recording...', 'running');
       break;
 
@@ -1166,15 +1175,65 @@ function openFullscreenImage(imageSrc) {
 async function refreshRecordingState() {
   const tabId = await getActiveTabId();
   if (!tabId) return;
+
+  // Check if this tab has a pending "record this tab?" prompt from the background.
+  if (IS_HUD && _overlayTabId) {
+    const promptKey = `crossTabPrompt_${_overlayTabId}`;
+    const stored = await chrome.storage.local.get(promptKey);
+    const prompt = stored[promptKey];
+    if (prompt) {
+      console.log("[popup][cross-tab] Pending prompt found for tab", _overlayTabId, "domain:", prompt.domain);
+      showCrossTabPrompt(prompt.domain);
+      return; // Don't check recording state — we're in prompt mode
+    }
+  }
+
   const resp = await chrome.runtime.sendMessage({ type: "get_recording_state", tabId });
   if (resp?.ok) {
     state.isRecording = Boolean(resp.isRecording);
     renderRecordButton();
-    if (state.isRecording) {
+    if (resp.isReplaying) {
+      state.isReplaying = true;
+      setUIMode('replaying');
+      setStatus("Replaying…", "running");
+      // Start live polling using the origin tab's report (where steps are stored)
+      startLinkedTabReplayPolling(resp.replayOriginTabId || tabId);
+    } else if (state.isRecording) {
       setUIMode('recording');
       setStatus("Recording…", "running");
     }
   }
+}
+
+function showCrossTabPrompt(domain) {
+  if (els.crossTabPromptBanner) {
+    els.crossTabPromptBanner.style.display = '';
+    if (els.crossTabPromptDomain) {
+      els.crossTabPromptDomain.textContent = domain ? `Page: ${domain}` : 'Record your actions on this tab.';
+    }
+  }
+}
+
+function hideCrossTabPrompt() {
+  if (els.crossTabPromptBanner) els.crossTabPromptBanner.style.display = 'none';
+}
+
+function startLinkedTabReplayPolling(reportTabId) {
+  const pollInterval = setInterval(async () => {
+    try {
+      const resp = await chrome.runtime.sendMessage({ type: "get_last_report", tabId: reportTabId });
+      if (!resp?.ok || !resp.report) { clearInterval(pollInterval); return; }
+      renderStepsWithProgress(resp.report);
+      const done = resp.report.steps?.filter(s => s.status === 'passed' || s.status === 'failed').length || 0;
+      const total = resp.report.steps?.length || 0;
+      if (resp.report.status === 'running') {
+        setStatus(`Replaying ${done}/${total}…`, 'running');
+        updateModeHeader('Replaying...', 'running', `${done}/${total}`);
+      } else {
+        clearInterval(pollInterval);
+      }
+    } catch { clearInterval(pollInterval); }
+  }, 500);
 }
 
 async function refreshRecordedSteps() {
@@ -4385,6 +4444,54 @@ chrome.storage.local.get(['lastSelectedRecordingId', 'lastReplayEnvId'], (result
     setStatus(`⚠ Service worker error: ${err?.message}`, "failure");
   }
 })();
+
+// ── Cross-tab prompt buttons ──────────────────────────────────
+els.confirmRecordTabBtn?.addEventListener('click', async () => {
+  const tabId = _overlayTabId || (await getActiveTabId());
+  console.log("[popup][cross-tab] 'Record this tab' clicked, tabId:", tabId);
+  if (!tabId) return;
+  hideCrossTabPrompt();
+  setStatus("Starting recording…", "running");
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "confirm_record_new_tab", tabId });
+    console.log("[popup][cross-tab] confirm_record_new_tab response:", resp);
+    if (!resp?.ok) throw new Error(resp?.error || "Failed to start recording");
+    state.isRecording = true;
+    setUIMode('recording');
+    setStatus("Recording…", "running");
+    renderRecordButton();
+  } catch (err) {
+    console.error("[popup][cross-tab] Failed to start recording on new tab:", err);
+    setStatus(`Error: ${err.message}`, "failure");
+  }
+});
+
+els.dismissPromptBtn?.addEventListener('click', async () => {
+  const tabId = _overlayTabId;
+  console.log("[popup][cross-tab] Prompt dismissed, tabId:", tabId);
+  if (tabId) await chrome.storage.local.remove(`crossTabPrompt_${tabId}`).catch(() => {});
+  hideCrossTabPrompt();
+});
+
+// ── Discard recording ─────────────────────────────────────────
+els.discardRecordingBtn?.addEventListener('click', async () => {
+  const confirmed = window.confirm("Discard this recording? All captured steps will be lost and nothing will be saved.");
+  if (!confirmed) return;
+  const tabId = await getActiveTabId();
+  console.log("[popup][discard] Discarding recording, tabId:", tabId);
+  if (!tabId) return;
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: "discard_recording", tabId });
+    console.log("[popup][discard] discard_recording response:", resp);
+    state.isRecording = false;
+    setUIMode('home');
+    renderRecordButton();
+    setStatus("Recording discarded.", "idle");
+  } catch (err) {
+    console.error("[popup][discard] Discard failed:", err);
+    setStatus(`Discard failed: ${err.message}`, "failure");
+  }
+});
 
 // ── Network Filters ───────────────────────────────────────────
 
