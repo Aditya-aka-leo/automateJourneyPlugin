@@ -134,10 +134,11 @@ class RunParallelResponse(BaseModel):
 
 class RunSpecRequest(BaseModel):
     spec_path: str = Field(description="Path to the .spec.ts file to execute")
+    base_url: Optional[str] = Field(default=None, description="Base URL passed as BASE_URL env var and playwright baseURL")
     headed: bool = Field(default=False, description="Run with visible browser window")
     browsers: list[str] = Field(default_factory=lambda: ["chromium"], description="Browsers to run on")
     trace: bool = Field(default=True, description="Enable trace recording")
-    video: bool = Field(default=False, description="Enable video recording")
+    video: bool = Field(default=True, description="Enable video recording")
     screenshots: bool = Field(default=True, description="Capture screenshots on failure")
 
 

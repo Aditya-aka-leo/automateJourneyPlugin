@@ -5,6 +5,7 @@ import {
   FolderIcon,
   UsersIcon,
   BeakerIcon,
+  CloudArrowDownIcon,
 } from '@heroicons/react/24/outline';
 
 const links = [
@@ -13,6 +14,7 @@ const links = [
   { to: '/projects', icon: FolderIcon, label: 'Projects' },
   { to: '/users', icon: UsersIcon, label: 'Users' },
   { to: '/tests', icon: BeakerIcon, label: 'Tests' },
+  { to: '/sources', icon: CloudArrowDownIcon, label: 'Sources' },
 ];
 
 export default function Sidebar() {

@@ -1248,10 +1248,11 @@ async def run_api_test(
 
 async def run_spec_file(
     spec_path: str,
+    base_url: str | None = None,
     headed: bool = False,
     browsers: list[str] | None = None,
     trace: bool = True,
-    video: bool = False,
+    video: bool = True,
     screenshots: bool = True,
 ) -> tuple[SpecTestReport, dict]:
     """
@@ -1291,26 +1292,30 @@ async def run_spec_file(
     if headed:
         cmd.append("--headed")
 
-    # Create a minimal playwright.config.ts in the spec directory if missing
+    # Always write a fresh playwright.config.ts so baseURL and settings are current
     config_path = spec.parent / "playwright.config.ts"
-    if not config_path.exists():
-        config_content = (
-            'import { defineConfig, devices } from "@playwright/test";\n'
-            "export default defineConfig({\n"
-            '  use: { screenshot: "on" },\n'
-            "  projects: [\n"
-        )
-        for b in browsers:
-            device_map = {
-                "chromium": "Desktop Chrome",
-                "firefox": "Desktop Firefox",
-                "webkit": "Desktop Safari",
-            }
-            device = device_map.get(b, "Desktop Chrome")
-            config_content += f'    {{ name: "{b}", use: {{ ...devices["{device}"] }} }},\n'
-        config_content += "  ],\n});\n"
-        config_path.write_text(config_content)
-        logger.info(f"[run-spec:{run_id}] Created playwright.config.ts with projects: {browsers}")
+    use_opts = '"screenshot": "on"'
+    if base_url:
+        use_opts += f', "baseURL": "{base_url}"'
+    if video:
+        use_opts += ', "video": "on"'
+    config_content = (
+        'import { defineConfig, devices } from "@playwright/test";\n'
+        "export default defineConfig({\n"
+        f"  use: {{ {use_opts} }},\n"
+        "  projects: [\n"
+    )
+    for b in browsers:
+        device_map = {
+            "chromium": "Desktop Chrome",
+            "firefox": "Desktop Firefox",
+            "webkit": "Desktop Safari",
+        }
+        device = device_map.get(b, "Desktop Chrome")
+        config_content += f'    {{ name: "{b}", use: {{ ...devices["{device}"] }} }},\n'
+    config_content += "  ],\n});\n"
+    config_path.write_text(config_content)
+    logger.info(f"[run-spec:{run_id}] Wrote playwright.config.ts — baseURL={base_url or '(none)'}, video={video}, projects: {browsers}")
 
     # Set projects (browsers)
     for browser in browsers:
@@ -1319,16 +1324,13 @@ async def run_spec_file(
     # Build environment for playwright config
     env = os.environ.copy()
     env["PLAYWRIGHT_JSON_OUTPUT_NAME"] = str(run_dir / "results.json")
-    # Ensure globally-installed @playwright/test is resolvable from any cwd
     env["NODE_PATH"] = "/usr/lib/node_modules"
+    if base_url:
+        env["BASE_URL"] = base_url
 
-    # Configure trace, video, screenshots via env/CLI
+    # --trace is a valid CLI flag; video and screenshot go in playwright.config.ts
     if trace:
         cmd.append("--trace=on")
-    if video:
-        cmd.append("--video=on")
-    # Screenshots are captured automatically by Playwright on failure;
-    # there is no --screenshot CLI flag.
 
     logger.info(f"[run-spec:{run_id}] Executing: {' '.join(cmd)}")
 

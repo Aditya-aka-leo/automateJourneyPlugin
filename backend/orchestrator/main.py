@@ -37,6 +37,7 @@ log = logging.getLogger("orchestrator")
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://registry:8003")
 GENERATOR_URL = os.getenv("GENERATOR_URL", "http://generator:8002")
 RUNNER_URL = os.getenv("RUNNER_URL", "http://runner:8001")
+AGGREGATOR_URL = os.getenv("AGGREGATOR_URL", "http://aggregator:8005")
 
 # Endpoints that don't require authentication
 PUBLIC_PATHS = {
@@ -180,7 +181,7 @@ async def health():
     """Return orchestrator health + downstream service status."""
     statuses = {}
     async with httpx.AsyncClient(timeout=5) as client:
-        for name, url in [("registry", REGISTRY_URL), ("generator", GENERATOR_URL), ("runner", RUNNER_URL)]:
+        for name, url in [("registry", REGISTRY_URL), ("generator", GENERATOR_URL), ("runner", RUNNER_URL), ("aggregator", AGGREGATOR_URL)]:
             try:
                 resp = await client.get(f"{url}/health")
                 statuses[name] = "healthy" if resp.status_code == 200 else f"unhealthy ({resp.status_code})"
@@ -327,12 +328,28 @@ async def runner_proxy(request: Request, path: str):
 
 # ── Startup logging ──────────────────────────────────────────────
 
+@app.get("/aggregator/health")
+async def aggregator_health(request: Request):
+    """Proxy aggregator health — no auth required."""
+    return await proxy_request(request, AGGREGATOR_URL, "/health")
+
+
+@app.api_route("/aggregator/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def aggregator_proxy(request: Request, path: str):
+    """Proxy /aggregator/* → Aggregator service (strip prefix)."""
+    ctx = await get_auth_context(request)
+    if not ctx:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return await proxy_request(request, AGGREGATOR_URL, f"/{path}")
+
+
 @app.on_event("startup")
 async def startup():
     log.info("Orchestrator started")
-    log.info("  Registry  → %s", REGISTRY_URL)
-    log.info("  Generator → %s", GENERATOR_URL)
-    log.info("  Runner    → %s", RUNNER_URL)
+    log.info("  Registry   → %s", REGISTRY_URL)
+    log.info("  Generator  → %s", GENERATOR_URL)
+    log.info("  Runner     → %s", RUNNER_URL)
+    log.info("  Aggregator → %s", AGGREGATOR_URL)
 
 
 if __name__ == "__main__":

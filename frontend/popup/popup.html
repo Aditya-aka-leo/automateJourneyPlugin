@@ -109,6 +109,11 @@
           <span>Headless</span>
           <span id="homeHeadlessStatus" class="home-btn__status"></span>
         </button>
+        <button id="homeSourcesBtn" class="home-btn home-btn--sources login-gated" type="button">
+          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <span>Sources</span>
+          <span id="homeSourcesStatus" class="home-btn__status"></span>
+        </button>
       </div>
 
       <!-- Selectors row -->
@@ -296,6 +301,52 @@
           <span>Playwright Runner</span>
           <button id="playwrightPanelClose" class="btn-icon btn-icon--sm" type="button" title="Close">&times;</button>
         </div>
+
+        <!-- Run mode tabs -->
+        <div style="display:flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:10px;">
+          <button id="pwModeRecording" type="button" style="flex:1;padding:5px 8px;font-size:11px;font-weight:600;background:var(--brand);color:#fff;border:none;cursor:pointer;">Recording</button>
+          <button id="pwModeSpec" type="button" style="flex:1;padding:5px 8px;font-size:11px;font-weight:600;background:transparent;color:var(--muted);border:none;cursor:pointer;">Spec File</button>
+        </div>
+
+        <!-- Spec File section -->
+        <div id="pwSpecSection" style="display:none;margin-bottom:8px;">
+          <!-- Pull a new source -->
+          <div class="sources-add-form">
+            <input id="sourcesRepoUrl" class="input input--sm" type="url" placeholder="https://github.com/org/repo" />
+            <input id="sourcesBranch" class="input input--sm" type="text" placeholder="main" value="main" style="width:72px;" />
+            <button id="sourcesAddBtn" class="btn btn--primary btn--sm" type="button">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 16v1a3 3 0 0 0 3 3h10a3 3 0 0 0 3-3v-1"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Pull
+            </button>
+          </div>
+          <div id="sourcesAddStatus" class="status-text" style="margin-top:3px;margin-bottom:6px;"></div>
+          <!-- Source + Branch selectors -->
+          <div class="pw-field">
+            <span class="pw-field-label">Repository</span>
+            <select id="pwSourceSelect" class="select" style="width:100%;font-size:11px;"></select>
+          </div>
+          <div class="pw-field" style="margin-top:6px;">
+            <span class="pw-field-label">Branch</span>
+            <select id="pwBranchSelect" class="select" style="width:100%;font-size:11px;"></select>
+          </div>
+          <!-- Spec selector -->
+          <div class="pw-field" style="margin-top:6px;">
+            <span class="pw-field-label">Spec File</span>
+            <select id="pwSpecSelect" class="select" style="width:100%;font-size:11px;"></select>
+          </div>
+          <!-- Base URL -->
+          <div class="pw-field" style="margin-top:6px;">
+            <span class="pw-field-label">Base URL</span>
+            <input id="pwSpecBaseUrl" type="url" class="input input--sm" placeholder="https://example.com" style="width:100%;" />
+          </div>
+          <!-- hidden stub for JS compat -->
+          <div id="sourcesList" style="display:none;"></div>
+          <button id="sourcesRefreshBtn" class="btn btn--ghost btn--xs" type="button" style="width:100%;margin-top:8px;">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+            Refresh Sources
+          </button>
+        </div>
+
         <div class="pw-config">
           <div class="pw-field">
             <span class="pw-field-label">Browsers</span>
@@ -390,6 +441,9 @@
           Rerun
         </button>
       </div>
+
+      <!-- sourcesPanel stub — content moved into Playwright Runner Spec File tab -->
+      <div id="sourcesPanel" style="display:none;"></div>
 
       <!-- Replay controls (shown only during replay) -->
       <div id="replayControlsBar" class="replay-controls-bar" style="display:none;">
@@ -565,5 +619,16 @@
     </div>
 
     <script type="module" src="popup.js"></script>
+
+    <!-- Spec Run Result Modal -->
+    <div id="specResultModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.82);z-index:9999;overflow-y:auto;padding:12px;">
+      <div style="background:var(--panel);border-radius:12px;border:1px solid var(--border);padding:16px;position:relative;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <div id="specResultModalTitle" style="font-size:13px;font-weight:600;color:var(--text);"></div>
+          <button id="specResultModalClose" class="btn-icon btn-icon--sm" type="button">&times;</button>
+        </div>
+        <div id="specResultModalContent"></div>
+      </div>
+    </div>
   </body>
 </html>

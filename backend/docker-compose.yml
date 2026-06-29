@@ -32,6 +32,7 @@ services:
       - REGISTRY_URL=http://registry:8003
       - GENERATOR_URL=http://generator:8002
       - RUNNER_URL=http://runner:8001
+      - AGGREGATOR_URL=http://aggregator:8005
     restart: unless-stopped
     networks:
       - autotest-network
@@ -39,6 +40,7 @@ services:
       - registry
       - generator
       - runner
+      - aggregator
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
@@ -139,6 +141,31 @@ services:
       start_period: 5s
 
   # ===========================================
+  # Test Aggregator — pulls specs from git repos into tests-store (internal)
+  # ===========================================
+  aggregator:
+    build:
+      context: ./aggregator
+      dockerfile: Dockerfile
+    container_name: autotest-aggregator
+    # No ports exposed — accessed only via orchestrator
+    environment:
+      - TESTS_STORE_ROOT=/app/tests-store
+      - SOURCES_STORE=/app/sources-store
+    volumes:
+      - tests-store:/app/tests-store
+      - aggregator-sources:/app/sources-store
+    restart: unless-stopped
+    networks:
+      - autotest-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8005/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ===========================================
   # Admin UI — React admin dashboard (port 8004)
   # ===========================================
   admin:
@@ -166,6 +193,8 @@ volumes:
   tests-store:
     driver: local
   registry-db:
+    driver: local
+  aggregator-sources:
     driver: local
   # Uncomment for Option B (fully self-contained credentials)
   # claude-credentials:

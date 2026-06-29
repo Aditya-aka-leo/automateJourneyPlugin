@@ -116,6 +116,13 @@ const els = {
   // Playwright Runner
   playwrightPanel: document.getElementById("playwrightPanel"),
   playwrightPanelClose: document.getElementById("playwrightPanelClose"),
+  pwModeRecording: document.getElementById("pwModeRecording"),
+  pwModeSpec: document.getElementById("pwModeSpec"),
+  pwSpecSection: document.getElementById("pwSpecSection"),
+  pwSourceSelect: document.getElementById("pwSourceSelect"),
+  pwBranchSelect: document.getElementById("pwBranchSelect"),
+  pwSpecSelect: document.getElementById("pwSpecSelect"),
+  pwSpecBaseUrl: document.getElementById("pwSpecBaseUrl"),
   pwBrowserGroup: document.getElementById("pwBrowserGroup"),
   pwDeviceGroup: document.getElementById("pwDeviceGroup"),
   pwTrace: document.getElementById("pwTrace"),
@@ -177,6 +184,22 @@ const els = {
   homeGenerateStatus: document.getElementById("homeGenerateStatus"),
   homeReplayStatus: document.getElementById("homeReplayStatus"),
   homeHeadlessStatus: document.getElementById("homeHeadlessStatus"),
+  homeSourcesStatus: document.getElementById("homeSourcesStatus"),
+  // Sources panel
+  homeSourcesBtn: document.getElementById("homeSourcesBtn"),
+  sourcesPanel: document.getElementById("sourcesPanel"),
+  sourcesPanelClose: document.getElementById("sourcesPanelClose"),
+  sourcesRepoUrl: document.getElementById("sourcesRepoUrl"),
+  sourcesBranch: document.getElementById("sourcesBranch"),
+  sourcesAddBtn: document.getElementById("sourcesAddBtn"),
+  sourcesAddStatus: document.getElementById("sourcesAddStatus"),
+  sourcesBaseUrl: document.getElementById("sourcesBaseUrl"),
+  specResultModal: document.getElementById("specResultModal"),
+  specResultModalClose: document.getElementById("specResultModalClose"),
+  specResultModalTitle: document.getElementById("specResultModalTitle"),
+  specResultModalContent: document.getElementById("specResultModalContent"),
+  sourcesList: document.getElementById("sourcesList"),
+  sourcesRefreshBtn: document.getElementById("sourcesRefreshBtn"),
   // Network Filters
   nfToggleBtn: document.getElementById("nfToggleBtn"),
   nfBody: document.getElementById("nfBody"),
@@ -2735,6 +2758,93 @@ els.playwrightPanelClose?.addEventListener("click", () => {
   setUIMode('home');
 });
 
+// ── Spec / Recording mode toggle ─────────────────────────
+function _setPwMode(mode) {
+  const isSpec = mode === 'spec';
+  if (els.pwModeRecording) {
+    els.pwModeRecording.style.background = isSpec ? 'transparent' : 'var(--brand)';
+    els.pwModeRecording.style.color = isSpec ? 'var(--muted)' : '#fff';
+  }
+  if (els.pwModeSpec) {
+    els.pwModeSpec.style.background = isSpec ? 'var(--brand)' : 'transparent';
+    els.pwModeSpec.style.color = isSpec ? '#fff' : 'var(--muted)';
+  }
+  if (els.pwSpecSection) els.pwSpecSection.style.display = isSpec ? 'block' : 'none';
+}
+
+let _pwSources = [];
+
+function _populatePwBranches(sourceId) {
+  if (!els.pwBranchSelect) return;
+  const src = _pwSources.find(s => s.source_id === sourceId);
+  if (!src) return;
+  // Sources currently store one branch each; group by repo_url to show all branches
+  const samerepo = _pwSources.filter(s => s.repo_url === src.repo_url);
+  els.pwBranchSelect.innerHTML = '';
+  samerepo.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.source_id;
+    opt.textContent = s.branch;
+    opt.selected = s.source_id === sourceId;
+    els.pwBranchSelect.appendChild(opt);
+  });
+  _populatePwSpecs(sourceId);
+}
+
+function _populatePwSpecs(sourceId) {
+  if (!els.pwSpecSelect) return;
+  const src = _pwSources.find(s => s.source_id === sourceId);
+  if (!src) { els.pwSpecSelect.innerHTML = '<option value="">No specs</option>'; return; }
+  els.pwSpecSelect.innerHTML = '';
+  (src.spec_files || []).forEach(f => {
+    const opt = document.createElement('option');
+    opt.value = `${src.specs_dir}/${f}`;
+    opt.textContent = f;
+    els.pwSpecSelect.appendChild(opt);
+  });
+}
+
+async function _loadPwSpecs() {
+  if (!els.pwSourceSelect) return;
+  els.pwSourceSelect.innerHTML = '<option value="">Loading...</option>';
+  try {
+    const data = await _registryApiCall('GET', '/aggregator/sources', null);
+    _pwSources = data.sources || [];
+    if (!_pwSources.length) {
+      els.pwSourceSelect.innerHTML = '<option value="">No repos — pull one above</option>';
+      if (els.pwBranchSelect) els.pwBranchSelect.innerHTML = '';
+      if (els.pwSpecSelect) els.pwSpecSelect.innerHTML = '';
+      return;
+    }
+    // Populate source dropdown (unique repos)
+    const seen = new Set();
+    els.pwSourceSelect.innerHTML = '';
+    _pwSources.forEach(src => {
+      if (!seen.has(src.repo_url)) {
+        seen.add(src.repo_url);
+        const opt = document.createElement('option');
+        opt.value = src.source_id;
+        opt.textContent = src.name;
+        els.pwSourceSelect.appendChild(opt);
+      }
+    });
+    _populatePwBranches(_pwSources[0].source_id);
+  } catch (err) {
+    els.pwSourceSelect.innerHTML = `<option value="">Error: ${err.message}</option>`;
+  }
+}
+
+els.pwSourceSelect?.addEventListener('change', () => {
+  _populatePwBranches(els.pwSourceSelect.value);
+});
+
+els.pwBranchSelect?.addEventListener('change', () => {
+  _populatePwSpecs(els.pwBranchSelect.value);
+});
+
+els.pwModeRecording?.addEventListener('click', () => _setPwMode('recording'));
+els.pwModeSpec?.addEventListener('click', () => { _setPwMode('spec'); _loadPwSpecs(); });
+
 // Helper: fetch a screenshot URL and return a base64 data URL, or null on failure
 async function _pwFetchScreenshotBase64(url) {
   try {
@@ -2932,6 +3042,91 @@ async function _pwDownloadHtmlReport(reportData, filename) {
 let _pwLastResults = null;
 
 els.pwRunBtn?.addEventListener("click", async () => {
+  const isSpecMode = els.pwModeSpec?.style.background === 'var(--brand)';
+
+  // ── Spec File mode ────────────────────────────────────────
+  if (isSpecMode) {
+    const specPath = els.pwSpecSelect?.value;
+    if (!specPath) {
+      els.pwStatus.textContent = 'Select a spec file first.';
+      els.pwStatus.style.color = 'var(--red)';
+      return;
+    }
+    const selectedBrowsers = [...(els.pwBrowserGroup?.querySelectorAll('input:checked') || [])]
+      .map(cb => cb.value).filter(Boolean);
+    if (!selectedBrowsers.length) {
+      els.pwStatus.textContent = 'Select at least one browser.';
+      els.pwStatus.style.color = 'var(--red)';
+      return;
+    }
+    const baseUrl = els.pwSpecBaseUrl?.value?.trim() || null;
+    els.pwStatus.textContent = 'Running spec...';
+    els.pwStatus.style.color = 'var(--blue)';
+    els.pwRunBtn.disabled = true;
+    try {
+      const result = await _registryApiCall('POST', '/runner/run-spec', {
+        spec_path: specPath,
+        base_url: baseUrl,
+        browsers: selectedBrowsers,
+        screenshots: true,
+        video: true,
+      });
+      const ok = result.ok;
+      const dur = result.report?.duration_ms ? `${(result.report.duration_ms / 1000).toFixed(1)}s` : '';
+      const passed = result.report?.passed ?? 0;
+      const total = (result.report?.passed ?? 0) + (result.report?.failed ?? 0);
+      els.pwStatus.textContent = ok ? `✓ Passed — ${passed}/${total} · ${dur}` : `✗ Failed — ${passed}/${total} · ${dur}`;
+      els.pwStatus.style.color = ok ? 'var(--green)' : 'var(--red)';
+
+      // Show result modal
+      const specName = specPath.split('/').pop();
+      if (els.specResultModal) {
+        els.specResultModalTitle.textContent = specName;
+        let html = `<div style="border-radius:8px;padding:10px 12px;margin-bottom:12px;display:flex;align-items:center;gap:8px;
+            background:${ok ? 'rgba(46,204,113,0.1)' : 'rgba(255,77,77,0.1)'};
+            border:1px solid ${ok ? 'rgba(46,204,113,0.3)' : 'rgba(255,77,77,0.3)'};">
+          <span style="font-size:13px;font-weight:600;color:${ok ? '#2ecc71' : '#ff4d4d'};">${ok ? '✓ All tests passed' : '✗ Some tests failed'}</span>
+          <span style="margin-left:auto;font-size:11px;color:var(--muted);font-family:monospace;">${passed}/${total} passed${dur ? ' · ' + dur : ''}</span>
+        </div>`;
+        if (result.report?.tests?.length) {
+          html += `<div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:12px;">
+            <div style="background:var(--panel-raised);padding:6px 10px;font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;">Test Results</div>`;
+          result.report.tests.forEach(t => {
+            const tOk = t.status === 'passed';
+            html += `<div style="padding:8px 10px;border-top:1px solid var(--border);">
+              <div style="display:flex;align-items:flex-start;gap:8px;">
+                <span style="color:${tOk ? '#2ecc71' : '#ff4d4d'}">${tOk ? '✓' : '✗'}</span>
+                <div style="flex:1;min-width:0;">
+                  <div style="font-size:12px;color:var(--text);font-weight:500;">${t.title}</div>
+                  ${t.duration_ms ? `<div style="font-size:10px;color:var(--muted)">${(t.duration_ms/1000).toFixed(2)}s</div>` : ''}
+                  ${t.error ? `<pre style="margin:6px 0 0;font-size:10px;color:#ff6b6b;background:rgba(255,77,77,0.08);border:1px solid rgba(255,77,77,0.2);border-radius:4px;padding:6px;white-space:pre-wrap;word-break:break-all;max-height:80px;overflow-y:auto;">${t.error}</pre>` : ''}
+                </div>
+              </div>
+            </div>`;
+          });
+          html += `</div>`;
+        }
+        if (result.artifacts?.videoUrl) {
+          const { backendConfig } = await chrome.storage.local.get('backendConfig');
+          const backendUrl = backendConfig?.url || 'http://localhost:8000';
+          html += `<div style="margin-bottom:12px;">
+            <div style="font-size:10px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px;">Video Recording</div>
+            <video src="${backendUrl}/runner${result.artifacts.videoUrl}" controls autoplay loop muted
+              style="width:100%;border-radius:8px;border:1px solid var(--border);background:#000;display:block;"></video>
+          </div>`;
+        }
+        els.specResultModalContent.innerHTML = html;
+        els.specResultModal.style.display = 'block';
+      }
+    } catch (err) {
+      els.pwStatus.textContent = `Error: ${err.message}`;
+      els.pwStatus.style.color = 'var(--red)';
+    }
+    els.pwRunBtn.disabled = false;
+    return;
+  }
+
+  // ── Recording mode (existing flow) ───────────────────────
   const recordingId = els.recordingSelect.value;
   const selectedRecording = state.recordings.find((r) => r.id === recordingId);
   if (!selectedRecording || !selectedRecording.steps.length) {
@@ -3396,6 +3591,184 @@ els.homeReplayBtn?.addEventListener("click", () => {
 
 els.homeHeadlessBtn?.addEventListener("click", () => {
   setUIMode('headless');
+});
+
+// ============================================================
+// Sources Panel — pull Playwright specs from GitHub repos
+// ============================================================
+
+async function _registryApiCall(method, path, body) {
+  const [backendResult, registryResult] = await Promise.all([
+    chrome.storage.local.get(['backendConfig']),
+    chrome.storage.local.get(['registryConfig']),
+  ]);
+  const baseUrl = (backendResult.backendConfig?.url || 'http://localhost:8000').replace(/\/+$/, '');
+  const token = registryResult.registryConfig?.sessionToken;
+  if (!token) throw new Error('Not logged in — connect to registry first');
+  const resp = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!resp.ok) {
+    const err = await resp.json().catch(() => ({}));
+    throw new Error(err.detail || `HTTP ${resp.status}`);
+  }
+  return resp.json();
+}
+
+function _renderSourcesList(sources) {
+  if (!els.sourcesList) return;
+  if (!sources || sources.length === 0) {
+    els.sourcesList.innerHTML = '<div class="sources-empty">No sources yet — pull a GitHub repo above</div>';
+    return;
+  }
+  els.sourcesList.innerHTML = sources.map(src => `
+    <div class="source-item" data-source-id="${src.source_id}">
+      <div class="source-item__header" data-toggle="specs">
+        <span class="source-item__name" title="${src.repo_url}">${src.name}</span>
+        <div class="source-item__meta">
+          <span class="source-badge">${src.branch}</span>
+          <span class="source-badge">${src.spec_files?.length ?? 0} specs</span>
+        </div>
+        <div class="source-item__actions">
+          <button class="btn-icon btn-icon--xs sources-sync-btn" data-source-id="${src.source_id}" title="Sync latest">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
+          </button>
+          <button class="btn-icon btn-icon--xs sources-delete-btn" data-source-id="${src.source_id}" title="Delete source" style="color:#ff4d4d;">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="source-item__specs" id="specs-${src.source_id}">
+        ${(src.spec_files || []).map(f => `
+          <div class="spec-row spec-row--selectable"
+            data-spec-path="${src.specs_dir}/${f}"
+            title="Click to select">
+            <span class="spec-row__name">${f}</span>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `).join('');
+
+  // Toggle spec visibility
+  els.sourcesList.querySelectorAll('[data-toggle="specs"]').forEach(header => {
+    header.addEventListener('click', (e) => {
+      if (e.target.closest('button')) return;
+      const id = header.closest('.source-item').dataset.sourceId;
+      const specsDiv = document.getElementById(`specs-${id}`);
+      if (specsDiv) specsDiv.classList.toggle('open');
+    });
+  });
+
+  // Sync buttons
+  els.sourcesList.querySelectorAll('.sources-sync-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.sourceId;
+      btn.disabled = true;
+      try {
+        await _registryApiCall('POST', `/aggregator/sources/${id}/sync`, null);
+        await _loadAndRenderSources();
+      } catch (err) {
+        alert(`Sync failed: ${err.message}`);
+      }
+      btn.disabled = false;
+    });
+  });
+
+  // Delete buttons
+  els.sourcesList.querySelectorAll('.sources-delete-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.sourceId;
+      if (!confirm('Delete this source and all its spec files?')) return;
+      btn.disabled = true;
+      try {
+        await _registryApiCall('DELETE', `/aggregator/sources/${id}`, null);
+        await _loadAndRenderSources();
+      } catch (err) {
+        alert(`Delete failed: ${err.message}`);
+      }
+    });
+  });
+
+  // Click a spec row to select it in the dropdown
+  els.sourcesList.querySelectorAll('.spec-row--selectable').forEach(row => {
+    row.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const path = row.dataset.specPath;
+      if (els.pwSpecSelect && path) {
+        els.pwSpecSelect.value = path;
+        // Highlight selected
+        els.sourcesList.querySelectorAll('.spec-row--selectable').forEach(r =>
+          r.style.background = '');
+        row.style.background = 'rgba(124,92,255,0.12)';
+      }
+    });
+  });
+}
+
+async function _loadAndRenderSources() {
+  if (!els.sourcesList) return;
+  els.sourcesList.innerHTML = '<div class="sources-empty">Loading...</div>';
+  try {
+    const data = await _registryApiCall('GET', '/aggregator/sources', null);
+    _renderSourcesList(data.sources || []);
+  } catch (err) {
+    els.sourcesList.innerHTML = `<div class="sources-empty" style="color:#ff4d4d;">${err.message}</div>`;
+  }
+}
+
+els.homeSourcesBtn?.addEventListener('click', () => {
+  // Open Playwright Runner in Spec File mode
+  if (els.playwrightPanel) {
+    const app = document.querySelector('.app');
+    const isSidepanel = app?.classList.contains('sidepanel-mode');
+    if (isSidepanel) {
+      els.playwrightPanel.style.display = 'block';
+    } else {
+      ALL_MODE_CLASSES.forEach(c => app?.classList.remove(c));
+      app?.classList.add('app--headless');
+      els.playwrightPanel.style.display = 'block';
+    }
+  }
+  _setPwMode('spec');
+  _loadPwSpecs();
+  _loadAndRenderSources();
+});
+
+els.sourcesRefreshBtn?.addEventListener('click', () => {
+  _loadPwSpecs();
+});
+
+els.specResultModalClose?.addEventListener('click', () => {
+  if (els.specResultModal) els.specResultModal.style.display = 'none';
+});
+els.specResultModal?.addEventListener('click', (e) => {
+  if (e.target === els.specResultModal) els.specResultModal.style.display = 'none';
+});
+
+els.sourcesAddBtn?.addEventListener('click', async () => {
+  const url = els.sourcesRepoUrl?.value?.trim();
+  const branch = els.sourcesBranch?.value?.trim() || 'main';
+  if (!url) {
+    if (els.sourcesAddStatus) { els.sourcesAddStatus.textContent = 'Enter a repo URL'; els.sourcesAddStatus.style.color = '#ff4d4d'; }
+    return;
+  }
+  if (els.sourcesAddBtn) els.sourcesAddBtn.disabled = true;
+  if (els.sourcesAddStatus) { els.sourcesAddStatus.textContent = 'Pulling...'; els.sourcesAddStatus.style.color = '#888'; }
+  try {
+    const result = await _registryApiCall('POST', '/aggregator/aggregate', { repo_url: url, branch });
+    const count = result.source?.spec_files?.length ?? 0;
+    if (els.sourcesAddStatus) { els.sourcesAddStatus.textContent = `✓ Imported ${count} specs`; els.sourcesAddStatus.style.color = '#2ecc71'; }
+    if (els.sourcesRepoUrl) els.sourcesRepoUrl.value = '';
+    await _loadAndRenderSources();
+  } catch (err) {
+    if (els.sourcesAddStatus) { els.sourcesAddStatus.textContent = err.message; els.sourcesAddStatus.style.color = '#ff4d4d'; }
+  }
+  if (els.sourcesAddBtn) els.sourcesAddBtn.disabled = false;
 });
 
 // ============================================================

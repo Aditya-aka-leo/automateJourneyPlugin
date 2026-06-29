@@ -214,6 +214,7 @@ async def run_spec_endpoint(req: RunSpecRequest):
     try:
         report, artifact_urls = await run_spec_file(
             spec_path=_resolve_spec_path(req.spec_path),
+            base_url=req.base_url or None,
             headed=req.headed,
             browsers=req.browsers,
             trace=req.trace,
