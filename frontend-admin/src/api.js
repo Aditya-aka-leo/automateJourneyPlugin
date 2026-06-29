@@ -60,6 +60,17 @@ const api = {
     request('DELETE', `/registry/users/${userId}/roles/${roleId}`, null, token),
   listUserRoles: (userId, token) => request('GET', `/registry/users/${userId}/roles`, null, token),
 
+  // Aggregator — GitHub source import
+  listSources: (token) => request('GET', '/aggregator/sources', null, token),
+  getSource: (sourceId, token) => request('GET', `/aggregator/sources/${sourceId}`, null, token),
+  aggregateSource: (data, token) => request('POST', '/aggregator/aggregate', data, token),
+  syncSource: (sourceId, token) => request('POST', `/aggregator/sources/${sourceId}/sync`, null, token),
+  deleteSource: (sourceId, token) => request('DELETE', `/aggregator/sources/${sourceId}`, null, token),
+  listSpecs: (token) => request('GET', '/aggregator/specs', null, token),
+
+  // Runner — run a spec file
+  runSpec: (specPath, baseUrl, token) => request('POST', '/runner/run-spec', { spec_path: specPath, base_url: baseUrl || null, screenshots: true, video: true }, token),
+
   // Tests
   listTests: (token) => request('GET', '/registry/tests', null, token),
   getTest: (id, token) => request('GET', `/registry/tests/${id}`, null, token),

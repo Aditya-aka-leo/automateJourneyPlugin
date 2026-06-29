@@ -9,6 +9,7 @@ import ProjectsPage from './pages/ProjectsPage';
 import UsersPage from './pages/UsersPage';
 import TestsPage from './pages/TestsPage';
 import TestDetailPage from './pages/TestDetailPage';
+import SourcesPage from './pages/SourcesPage';
 
 export default function App() {
   return (
@@ -30,6 +31,7 @@ export default function App() {
             <Route path="users" element={<UsersPage />} />
             <Route path="tests" element={<TestsPage />} />
             <Route path="tests/:testId" element={<TestDetailPage />} />
+            <Route path="sources" element={<SourcesPage />} />
           </Route>
         </Routes>
       </BrowserRouter>
