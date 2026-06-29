@@ -198,11 +198,30 @@
         </div>
       </div>
 
+      <!-- Cross-tab recording prompt (shown on new tabs opened during a recording session) -->
+      <div id="crossTabPromptBanner" style="display:none; margin:8px 0; padding:10px 12px; background:var(--accent-subtle, #eef4ff); border:1px solid var(--accent, #4f8ef7); border-radius:6px;">
+        <div style="font-size:12px; font-weight:600; margin-bottom:6px; color:var(--text-primary, #1a1a1a);">Recording active on another tab</div>
+        <div id="crossTabPromptDomain" style="font-size:11px; color:var(--text-secondary, #666); margin-bottom:8px;"></div>
+        <div style="display:flex; gap:6px;">
+          <button id="confirmRecordTabBtn" class="btn btn--record" type="button" style="flex:1; font-size:11px; padding:5px 8px;">
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
+            Record this tab
+          </button>
+          <button id="dismissPromptBtn" class="btn" type="button" style="font-size:11px; padding:5px 10px; background:var(--surface-2,#f0f0f0); color:var(--text-secondary,#666);">
+            Dismiss
+          </button>
+        </div>
+      </div>
+
       <!-- Primary actions -->
       <div class="actions-primary">
         <button id="recordBtn" class="btn btn--record" type="button">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="10"/></svg>
           Record
+        </button>
+        <button id="discardRecordingBtn" class="btn btn--danger" type="button" title="Discard recording — all steps will be lost" style="display:none;">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+          Discard
         </button>
         <button id="assertModeBtn" class="btn btn--assert" type="button" title="Toggle assert mode — click page elements to add assertions" style="display:none;">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>

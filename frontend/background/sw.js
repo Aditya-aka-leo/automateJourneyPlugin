@@ -79,6 +79,14 @@ const selectorHealing = {
   autoApply: false
 };
 const healingSuggestionsByStepId = new Map();
+// Maps originTabId → Set of linked new-tab IDs recorded in the same session
+const linkedTabsByOrigin = new Map();
+// Maps tabId → its tab index within the current recording (0=origin, 1=first linked tab, etc.)
+const tabIndexByTabId = new Map();
+// The tab currently executing replay steps (switches on cross-tab; null when idle)
+let activeReplayTabId = null;
+// The origin tab where the replay was started (holds the lastReportByTab entry)
+let activeReplayOriginTabId = null;
 
 function getStepsForTab(tabId) {
   if (!stepsByTab.has(tabId)) stepsByTab.set(tabId, []);
@@ -251,6 +259,8 @@ async function startRecordingOnTab(tabId) {
   capturedNetworkByTab.set(tabId, []);
   recordingByTab.set(tabId, true);
   setRecordingBadge(tabId, true);
+  // tabIndex defaults to 0; linked tabs will override this in onCreated handler
+  if (!tabIndexByTabId.has(tabId)) tabIndexByTabId.set(tabId, 0);
 
   // Load network filter patterns and push them to the content script.
   const {
@@ -333,6 +343,105 @@ async function stopRecordingOnTab(tabId) {
   try {
     await chrome.tabs.sendMessage(tabId, { type: 'network_mock_teardown' });
   } catch {}
+
+  // Merge steps from any still-open linked tabs. Tabs that closed early were already
+  // merged inline by the onRemoved handler, so linked.size may be 0 here — that's fine.
+  const linked = linkedTabsByOrigin.get(tabId);
+  if (linked && linked.size > 0) {
+    const originSteps = getStepsForTab(tabId);
+    for (const linkedTabId of linked) {
+      originSteps.push(...getStepsForTab(linkedTabId));
+      recordingByTab.set(linkedTabId, false);
+      try { await chrome.tabs.sendMessage(linkedTabId, { type: "recorder_stop" }); } catch (_) {}
+      try { await chrome.tabs.sendMessage(linkedTabId, { type: 'network_mock_teardown' }); } catch (_) {}
+      stepsByTab.delete(linkedTabId);
+      capturedNetworkByTab.delete(linkedTabId);
+    }
+    originSteps.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  }
+  linkedTabsByOrigin.delete(tabId);
+  tabIndexByTabId.delete(tabId);
+}
+
+// Waits for a specific tab to load a real http/https URL.
+// Handles blank new tabs (chrome://newtab) by continuing to watch until the user
+// navigates to a real URL, or until timeoutMs (default 60 s for manual navigation).
+function waitForTabLoad(tabId, timeoutMs = 60000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    function done(tab) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(tab);
+    }
+    const timer = setTimeout(() => done(null), timeoutMs);
+    function isRealUrl(url) {
+      return url && (url.startsWith('http://') || url.startsWith('https://'));
+    }
+    function onUpdated(id, info, tab) {
+      if (id !== tabId) return;
+      if (info.status === 'complete' && isRealUrl(tab.url)) done(tab);
+    }
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.get(tabId).then(tab => {
+      if (tab.status === 'complete' && isRealUrl(tab.url)) done(tab);
+    }).catch(() => {});
+  });
+}
+
+// Waits up to timeoutMs for any tab to load whose hostname matches domain.
+// Also checks existing tabs immediately in case the tab already loaded before this is called.
+function waitForTabWithDomain(domain, timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    function done(tab) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(tab);
+    }
+    const timer = setTimeout(() => done(null), timeoutMs);
+    function onUpdated(id, info, tab) {
+      if (info.status !== 'complete' || !tab.url) return;
+      try { if (new URL(tab.url).hostname === domain) done(tab); } catch (_) {}
+    }
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.query({}).then(tabs => {
+      for (const tab of tabs) {
+        if (tab.status === 'complete' && tab.url) {
+          try { if (new URL(tab.url).hostname === domain) { done(tab); return; } } catch (_) {}
+        }
+      }
+    }).catch(() => {});
+  });
+}
+
+// Waits for any brand-new tab to be created and load a real URL.
+// Used during replay when switching to a same-domain tab (domain matching alone is ambiguous).
+function waitForNewTabCreated(timeoutMs = 30000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let pendingTabId = null;
+    function done(tab) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onCreated.removeListener(onCreated);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      resolve(tab);
+    }
+    const timer = setTimeout(() => done(null), timeoutMs);
+    function onCreated(tab) { pendingTabId = tab.id; }
+    function onUpdated(id, info, tab) {
+      if (id !== pendingTabId || info.status !== 'complete') return;
+      if (tab.url && (tab.url.startsWith('http://') || tab.url.startsWith('https://'))) done(tab);
+    }
+    chrome.tabs.onCreated.addListener(onCreated);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
 }
 
 async function loadFlows() {
@@ -368,6 +477,8 @@ function normalizeStep(step) {
     value: step.value ?? null,
     envId: step.envId || null,
     appId: step.appId || null,
+    tabDomain: step.tabDomain || null,
+    tabIndex: step.tabIndex ?? 0,
     meta: step.meta || {}
   };
 }
@@ -680,10 +791,12 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
     throw new Error("Replay already in progress for this tab.");
   }
   replayLocks.set(tabId, true);
+  activeReplayTabId = tabId;
+  activeReplayOriginTabId = tabId;
   const report = buildReport({ envId: env?.id || null, steps, recordingId });
   lastReportByTab.set(tabId, report); // Store initial report
   
-  console.log("[autotest][replay] Starting replay on tab", tabId, 
+  console.log("[autotest][replay] Starting replay on tab", tabId,
     skipNavigation ? "(from-step, no navigation)" : "(full replay)",
     "in background mode");
   
@@ -755,9 +868,24 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
     console.log("[autotest][video] Video recording not started (disabled or onFailureOnly mode)");
   }
   
+  // activeTabId tracks which tab is currently being operated on.
+  // It starts as tabId (the original replay tab) but switches when a step's
+  // tabDomain differs — e.g. after a link opens a new tab.
+  let activeTabId = tabId;
+  // When we switch to a new tab we skip its first navigation step, because
+  // that tab was opened by a click (already at the right URL).
+  let skipNextNavOnNewTab = false;
+  // Tracks which tab session index is currently active (mirrors step.tabIndex)
+  let currentTabIndex = 0;
+  // Pre-registered watcher for a same-domain cross-tab switch.
+  // Started BEFORE the step that opens the new tab so the listener is
+  // already in place when the click fires — avoids the race where the tab
+  // is created before waitForNewTabCreated registers its onCreated listener.
+  let pendingNewTabWatcher = null;
+
   try {
     const envs = (await store.get(ENV_KEY)) || [];
-    
+
     for (let i = 0; i < steps.length; i += 1) {
       // Check if replay has been stopped
       if (!replayLocks.get(tabId)) {
@@ -802,7 +930,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       if (step?.type === "if_exists" || step?.type === "if_not_exists") {
         let elementFound = false;
         try {
-          const checkResp = await chrome.tabs.sendMessage(tabId, {
+          const checkResp = await chrome.tabs.sendMessage(activeTabId, {
             type: "replay_execute_step",
             step: { ...step, type: "assert_exists" },
             healingConfig: { enabled: false }
@@ -872,6 +1000,109 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       }
       
       console.log("[autotest][replay] step start", { idx: i, type: step?.type, envId: stepEnv?.id || null });
+
+      // ── Cross-tab tab-index switch ───────────────────────────────────────
+      // Switch tabs when the step's tabIndex differs from the currently active
+      // tabIndex. This handles BOTH different-domain and same-domain cross-tab.
+      const stepTabIndex = step.tabIndex ?? 0;
+      if (stepTabIndex !== currentTabIndex) {
+        let newTab = null;
+
+        if (stepTabIndex === 0) {
+          activeTabId = tabId;
+          currentTabIndex = 0;
+          skipNextNavOnNewTab = false;
+          activeReplayTabId = activeTabId;
+        } else {
+          const stepDomain = step.tabDomain || null;
+          let currentDomain = null;
+          try {
+            const currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
+            if (currentTab?.url) currentDomain = new URL(currentTab.url).hostname;
+          } catch (_) {}
+
+          if (stepDomain && stepDomain !== currentDomain) {
+            newTab = await waitForTabWithDomain(stepDomain, 30000);
+          } else if (pendingNewTabWatcher) {
+            // Listener was pre-registered before the triggering step — guaranteed
+            // to have caught the tab even if it opened before this code runs.
+            console.log(`[replay] Step ${i}: Using pre-registered tab watcher for same-domain cross-tab switch`);
+            newTab = await pendingNewTabWatcher;
+            pendingNewTabWatcher = null;
+          } else {
+            newTab = await waitForNewTabCreated(30000);
+          }
+
+          if (!newTab) {
+            const desc = stepDomain && stepDomain !== currentDomain
+              ? `domain "${stepDomain}"`
+              : `new tab (same domain "${currentDomain}")`;
+            const err = new Error(`Waiting for ${desc} — nothing appeared within 30 s`);
+            err.code = "CROSS_TAB_TIMEOUT";
+            stepReport.status = "failed";
+            stepReport.error = { message: err.message, code: err.code };
+            lastReportByTab.set(tabId, report);
+            throw err;
+          }
+
+          activeTabId = newTab.id;
+          currentTabIndex = stepTabIndex;
+          skipNextNavOnNewTab = true;
+          activeReplayTabId = activeTabId;
+        }
+
+        // Re-inject content scripts and show the HUD on the tab we just switched to
+        try {
+          await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js", "content/content.js"] });
+          await new Promise(r => setTimeout(r, 500));
+        } catch (injErr) {
+          console.warn("[autotest][replay] Could not inject content scripts into switched tab:", injErr?.message);
+        }
+        // Show the HUD so the user can see replay progress on the new tab
+        chrome.tabs.sendMessage(activeTabId, { type: "hud_show" }).catch(() => {});
+        // Also activate the tab so it's visible
+        chrome.tabs.update(activeTabId, { active: true }).catch(() => {});
+      }
+
+      // ── Pre-register tab watcher for the next step if it needs a same-domain switch ──
+      // We start waitForNewTabCreated HERE (before executing the current step) so
+      // its onCreated listener is in place when the click fires and opens the new tab.
+      // For different-domain switches, waitForTabWithDomain checks existing tabs at
+      // call time, so no pre-registration is needed there.
+      if (pendingNewTabWatcher === null) {
+        const nextStep = steps[i + 1];
+        if (nextStep) {
+          const nextTabIdx = nextStep.tabIndex ?? 0;
+          if (nextTabIdx !== currentTabIndex && nextTabIdx > 0) {
+            const nextDomain = nextStep.tabDomain || null;
+            let curDomain = null;
+            try {
+              const cur = await chrome.tabs.get(activeTabId).catch(() => null);
+              if (cur?.url) curDomain = new URL(cur.url).hostname;
+            } catch (_) {}
+            if (!nextDomain || nextDomain === curDomain) {
+              console.log(`[replay] Step ${i}: Pre-registering tab watcher for same-domain cross-tab switch at step ${i + 1}`);
+              pendingNewTabWatcher = waitForNewTabCreated(30000);
+            }
+          }
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────────────
+
+      // Skip the FIRST navigation step encountered after switching to a new tab.
+      // The tab is already open at the right URL (opened by the triggering click),
+      // so replaying the recorded navigation would reload to the old journey URL.
+      // Non-navigation steps do NOT clear the flag — we hold it until we see a nav.
+      if (step?.type === "navigation" && skipNextNavOnNewTab) {
+        skipNextNavOnNewTab = false;
+        stepReport.status = "passed";
+        stepReport.skipped = true;
+        stepReport.skipReason = "Initial navigation skipped — tab already open at this URL";
+        lastReportByTab.set(tabId, report);
+        continue;
+      }
+      // ────────────────────────────────────────────────────────────────────
+
       if (step?.type === "navigation") {
         const navKind = step?.meta?.kind;
         const prevStep = i > 0 ? steps[i - 1] : null;
@@ -892,13 +1123,13 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         
         const url = buildReplayUrl(stepEnv, step);
         console.log("[autotest][replay] navigation", { idx: i, url, kind: navKind });
-        await chrome.tabs.update(tabId, { url });
-        await waitForTabComplete(tabId);
-        
+        await chrome.tabs.update(activeTabId, { url });
+        await waitForTabComplete(activeTabId);
+
         // Add delay to ensure content script is initialized
         await new Promise(resolve => setTimeout(resolve, 500));
-        
-        const readyResp = await chrome.tabs.sendMessage(tabId, {
+
+        const readyResp = await chrome.tabs.sendMessage(activeTabId, {
           type: "replay_wait_ready"
         });
         
@@ -908,7 +1139,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           throw err;
         }
         stepReport.status = "passed";
-        stepReport.screenshot = await captureStepScreenshot(tabId, captureSettings, screenshots);
+        stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
         lastReportByTab.set(tabId, report); // Update report after each step
         continue;
       }
@@ -921,7 +1152,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       try {
         const pingStartTime = Date.now();
         const pingResp = await Promise.race([
-          chrome.tabs.sendMessage(tabId, { type: "ping" }),
+          chrome.tabs.sendMessage(activeTabId, { type: "ping" }),
           new Promise((_, rej) => setTimeout(() => rej(new Error("ping timeout")), 5000))
         ]);
         const pingDuration = Date.now() - pingStartTime;
@@ -930,44 +1161,10 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           console.log(`[autotest][replay] Step ${i}: Content script is alive`);
           contentScriptAlive = true;
           
-          // CRITICAL: If tab is hidden, wait for it to become visible
+          // If a new tab stole focus, bring the replay tab back to the foreground.
           if (pingResp?.documentHidden === true) {
-            console.warn(`[autotest][replay] Step ${i}: Tab is hidden, waiting for visibility...`);
-            
-            // Send HUD update about waiting
-            chrome.tabs.sendMessage(tabId, { 
-              type: "hud_update", 
-              report: {
-                ...report,
-                status: "waiting",
-                warning: "Tab is hidden. Replay will resume when tab becomes visible..."
-              }
-            }).catch(() => {});
-            
-            // Wait for tab to become visible
-            const maxWaitTime = 300000; // 5 minutes max
-            const waitStartTime = Date.now();
-            let isVisible = false;
-            
-            while (!isVisible && (Date.now() - waitStartTime) < maxWaitTime) {
-              await new Promise(resolve => setTimeout(resolve, 1000)); // Check every second
-              
-              try {
-                const visibilityCheck = await chrome.tabs.sendMessage(tabId, { type: "ping" });
-                if (visibilityCheck?.documentHidden === false) {
-                  isVisible = true;
-                  console.log(`[autotest][replay] Step ${i}: Tab is now visible, continuing...`);
-                }
-              } catch (err) {
-                // Tab might have closed or navigated
-                console.error(`[autotest][replay] Step ${i}: Error checking visibility:`, err);
-                break;
-              }
-            }
-            
-            if (!isVisible) {
-              throw new Error("Timeout waiting for tab to become visible");
-            }
+            console.log(`[autotest][replay] Step ${i}: Tab is hidden (another tab took focus), activating...`);
+            await chrome.tabs.update(activeTabId, { active: true });
           }
         }
       } catch (pingErr) {
@@ -981,22 +1178,22 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         let activateAttempts = 0;
         while (activateAttempts < 3) {
           try {
-            const tab = await chrome.tabs.get(tabId);
+            const tab = await chrome.tabs.get(activeTabId);
             console.log(`[autotest][replay] Step ${i}: Tab state before activation:`, {
               active: tab.active,
               status: tab.status,
               url: tab.url
             });
-            
-            await chrome.tabs.update(tabId, { active: true });
-            
+
+            await chrome.tabs.update(activeTabId, { active: true });
+
             // Verify activation
-            const updatedTab = await chrome.tabs.get(tabId);
+            const updatedTab = await chrome.tabs.get(activeTabId);
             console.log(`[autotest][replay] Step ${i}: Tab state after activation:`, {
               active: updatedTab.active,
               status: updatedTab.status
             });
-            
+
             if (updatedTab.active) {
               console.log(`[autotest][replay] Step ${i}: Tab successfully activated`);
               break;
@@ -1011,29 +1208,29 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
             }
           }
         }
-        
+
         if (activateAttempts >= 3) {
           console.error(`[autotest][replay] Step ${i}: FAILED to activate tab after 3 attempts`);
         }
-        
+
         // Add delay after activation to let Chrome settle
         await new Promise(resolve => setTimeout(resolve, 200));
       }
-      
+
       // If content script still not alive, try to reinject
       if (!contentScriptAlive) {
         console.log(`[autotest][replay] Step ${i}: Attempting to reinject content script...`);
         try {
           await chrome.scripting.executeScript({
-            target: { tabId: tabId },
+            target: { tabId: activeTabId },
             files: ['content/content.js']
           });
-          
+
           // Also reinject HUD if it was enabled for this tab
-          const hudState = await chrome.storage.local.get([`hudEnabled_${tabId}`]);
-          if (hudState[`hudEnabled_${tabId}`]) {
+          const hudState = await chrome.storage.local.get([`hudEnabled_${activeTabId}`]);
+          if (hudState[`hudEnabled_${activeTabId}`]) {
             await chrome.scripting.executeScript({
-              target: { tabId: tabId },
+              target: { tabId: activeTabId },
               files: ['content/hud.js']
             });
           }
@@ -1044,7 +1241,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           await new Promise(resolve => setTimeout(resolve, 500));
           
           // Verify it's now alive
-          const verifyResp = await chrome.tabs.sendMessage(tabId, { type: "ping" });
+          const verifyResp = await chrome.tabs.sendMessage(activeTabId, { type: "ping" });
           if (verifyResp?.alive) {
             console.log(`[autotest][replay] Step ${i}: Content script verified after reinjection`);
             contentScriptAlive = true;
@@ -1053,20 +1250,20 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           console.error(`[autotest][replay] Step ${i}: Failed to reinject content script:`, reinjectErr);
         }
       }
-      
+
       if (!contentScriptAlive) {
         console.error(`[autotest][replay] Step ${i}: Content script is not available, cannot continue`);
         throw new Error("Content script is not responding. The page may have been suspended or navigated.");
       }
-      
+
       console.log(`[autotest][replay] Step ${i}: Sending message to content script...`);
-      
+
       let resp;
       const stepTimeoutMs = 30000; // 30s max per step
       try {
         const sendStartTime = Date.now();
         resp = await Promise.race([
-          chrome.tabs.sendMessage(tabId, {
+          chrome.tabs.sendMessage(activeTabId, {
             type: "replay_execute_step",
             step,
             env: stepEnv,
@@ -1095,13 +1292,13 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
 
         if (isChannelError) {
           console.log("[autotest][replay] Step triggered navigation (channel closed), waiting for page load...");
-          await waitForTabComplete(tabId);
+          await waitForTabComplete(activeTabId);
           await new Promise(resolve => setTimeout(resolve, 500));
 
           // Re-inject content scripts — they are destroyed when the page navigates
           try {
-            await chrome.scripting.executeScript({ target: { tabId }, files: ["content/hud.js"] });
-            await chrome.scripting.executeScript({ target: { tabId }, files: ["content/content.js"] });
+            await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js"] });
+            await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/content.js"] });
             console.log("[autotest][replay] Re-injected content scripts after navigation");
             await new Promise(resolve => setTimeout(resolve, 300));
           } catch (injectErr) {
@@ -1111,13 +1308,13 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           // Now verify the new page is ready
           try {
             const readyResp = await Promise.race([
-              chrome.tabs.sendMessage(tabId, { type: "replay_wait_ready" }),
+              chrome.tabs.sendMessage(activeTabId, { type: "replay_wait_ready" }),
               new Promise((_, rej) => setTimeout(() => rej(new Error("ready check timeout")), 10000))
             ]);
             if (readyResp?.ok) {
               // Navigation completed successfully — treat the triggering step as passed
               stepReport.status = "passed";
-              stepReport.screenshot = await captureStepScreenshot(tabId, captureSettings, screenshots);
+              stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
               lastReportByTab.set(tabId, report);
               continue;
             }
@@ -1131,7 +1328,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           console.warn(`[autotest][replay] Step ${i} failed (soft mode, continuing):`, errMsg);
           stepReport.status = "soft_fail";
           stepReport.error = { message: errMsg, code: "EXEC_ERROR", soft: true };
-          stepReport.screenshot = await captureStepScreenshot(tabId, captureSettings, screenshots);
+          stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
           lastReportByTab.set(tabId, report);
           continue;
         }
@@ -1159,7 +1356,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           stepReport.selectorHealing = healingSuggestionsByStepId.get(step.id) || resp?.debug?.selectorHealing || null;
           stepReport.notFoundTarget = resp?.debug?.notFoundTarget || null;
           stepReport.error = { message: msg, code: err.code, soft: true };
-          stepReport.screenshot = await captureStepScreenshot(tabId, captureSettings, screenshots);
+          stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
           lastReportByTab.set(tabId, report);
           console.log(`[autotest][replay] Soft failure (${isAssertStep ? 'assertion' : 'action'}) — continuing:`, msg);
           // Continue to next step instead of throwing
@@ -1171,7 +1368,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           stepReport.selectorHealing = healingSuggestionsByStepId.get(step.id) || resp?.debug?.selectorHealing || null;
           stepReport.notFoundTarget = resp?.debug?.notFoundTarget || null;
           stepReport.error = { message: err.message, code: err.code };
-          stepReport.screenshot = await captureStepScreenshot(tabId, captureSettings, screenshots);
+          stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
           lastReportByTab.set(tabId, report);
           throw err;
         }
@@ -1182,7 +1379,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         stepReport.selectorAttempts = resp?.debug?.selectorAttempts || [];
         stepReport.selectorHealing = healingSuggestionsByStepId.get(step.id) || resp?.debug?.selectorHealing || null;
         stepReport.notFoundTarget = resp?.debug?.notFoundTarget || null;
-        stepReport.screenshot = await captureStepScreenshot(tabId, captureSettings, screenshots);
+        stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
         lastReportByTab.set(tabId, report);
       }
 
@@ -1194,21 +1391,21 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         await new Promise(r => setTimeout(r, 500)); // let navigation start
         try {
           await Promise.race([
-            chrome.tabs.sendMessage(tabId, { type: "ping" }),
+            chrome.tabs.sendMessage(activeTabId, { type: "ping" }),
             new Promise((_, rej) => setTimeout(() => rej(new Error("post-click ping timeout")), 3000))
           ]);
           // Content script still alive — no navigation, proceed normally
         } catch (_postClickErr) {
           // Content script gone — page likely navigated
           console.log("[autotest][replay] Post-click navigation detected, waiting for new page…");
-          await waitForTabComplete(tabId, 30000);
+          await waitForTabComplete(activeTabId, 30000);
           await new Promise(r => setTimeout(r, 800)); // wait for content script init via manifest
           // Verify new content script is alive
           let recovered = false;
           for (let attempt = 0; attempt < 3; attempt++) {
             try {
               const pr = await Promise.race([
-                chrome.tabs.sendMessage(tabId, { type: "ping" }),
+                chrome.tabs.sendMessage(activeTabId, { type: "ping" }),
                 new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), 3000))
               ]);
               if (pr?.alive) { recovered = true; break; }
@@ -1216,7 +1413,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
               // Try re-injecting on second attempt
               if (attempt === 1) {
                 try {
-                  await chrome.scripting.executeScript({ target: { tabId }, files: ["content/hud.js", "content/content.js"] });
+                  await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js", "content/content.js"] });
                   await new Promise(r => setTimeout(r, 500));
                 } catch {}
               }
@@ -1232,7 +1429,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       }
 
       // Send HUD update after each step
-      chrome.tabs.sendMessage(tabId, {
+      chrome.tabs.sendMessage(activeTabId, {
         type: "hud_update",
         report: report
       }).catch(() => {
@@ -1247,13 +1444,13 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       report.summary.softFailCount = report.steps.filter(s => s.status === "soft_fail").length;
     }
     lastReportByTab.set(tabId, report); // Final update
-    
-    // Send final HUD update
-    chrome.tabs.sendMessage(tabId, { 
-      type: "hud_update", 
-      report: report 
+
+    // Send final HUD update to whichever tab is currently active
+    chrome.tabs.sendMessage(activeTabId, {
+      type: "hud_update",
+      report: report
     }).catch(() => {});
-    
+
     setReplayBadge(tabId, steps.length, steps.length, "success");
     return { ok: true, report };
   } catch (err) {
@@ -1261,13 +1458,12 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
     if (err?.code === "USER_STOPPED") {
       finalizeReport(report, "stopped", err);
       lastReportByTab.set(tabId, report);
-      
-      // Send final HUD update on stop
-      chrome.tabs.sendMessage(tabId, { 
-        type: "hud_update", 
-        report: report 
+
+      chrome.tabs.sendMessage(activeTabId, {
+        type: "hud_update",
+        report: report
       }).catch(() => {});
-      
+
       setReplayBadge(tabId, 0, steps.length, "stopped");
       err.report = report;
       throw err;
@@ -1275,13 +1471,12 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       // Regular failure
       finalizeReport(report, "failed", err);
       lastReportByTab.set(tabId, report); // Update report on error
-      
-      // Send final HUD update on failure  
-      chrome.tabs.sendMessage(tabId, { 
-        type: "hud_update", 
-        report: report 
+
+      chrome.tabs.sendMessage(activeTabId, {
+        type: "hud_update",
+        report: report
       }).catch(() => {});
-      
+
       setReplayBadge(tabId, 0, steps.length, "failed");
       err.report = report;
       throw err;
@@ -1289,6 +1484,8 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
   } finally {
     replayLocks.delete(tabId);
     pausedReplays.delete(tabId); // Clear pause state
+    activeReplayTabId = null;
+    activeReplayOriginTabId = null;
     
     // Stop video recording if enabled
     console.log("[autotest][video] ===== STOPPING VIDEO RECORDING =====");
@@ -1530,23 +1727,93 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true };
     }
 
+    // Popup confirms (or declines) recording a newly opened tab
     // HUD "Stop Recording" button
     if (type === "stop_recording_from_hud") {
-      // Find which tab is recording
       const recordingTabId = sender?.tab?.id || tabId;
       if (recordingTabId) {
-        await stopRecordingOnTab(recordingTabId);
-        try {
-          await chrome.tabs.sendMessage(recordingTabId, { type: "hud_recording_stop" });
-        } catch (_) {}
+        // If this is a linked new tab, find its origin and stop that instead
+        // so the step merge logic in stopRecordingOnTab runs correctly.
+        let originTabId = recordingTabId;
+        for (const [origin, linked] of linkedTabsByOrigin.entries()) {
+          if (linked.has(recordingTabId)) { originTabId = origin; break; }
+        }
+        await stopRecordingOnTab(originTabId);
+        // Notify HUD on all involved tabs
+        try { await chrome.tabs.sendMessage(originTabId, { type: "hud_recording_stop" }); } catch (_) {}
+        if (originTabId !== recordingTabId) {
+          try { await chrome.tabs.sendMessage(recordingTabId, { type: "hud_recording_stop" }); } catch (_) {}
+        }
       }
+      return { ok: true };
+    }
+
+    // User clicked "Record this tab" in the new tab's HUD prompt.
+    if (type === "confirm_record_new_tab") {
+      console.log("[cross-tab] confirm_record_new_tab received, tabId:", tabId);
+      if (!tabId) return { ok: false, error: "NO_TAB" };
+      const storageKey = `crossTabPrompt_${tabId}`;
+      const stored = await chrome.storage.local.get(storageKey);
+      const prompt = stored[storageKey];
+      console.log("[cross-tab] Stored prompt data:", prompt);
+      if (!prompt?.originTabId || !recordingByTab.get(prompt.originTabId)) {
+        console.warn("[cross-tab] No active recording found for origin tab", prompt?.originTabId);
+        return { ok: false, error: "No active recording session found." };
+      }
+      const { originTabId, domain } = prompt;
+      if (!linkedTabsByOrigin.has(originTabId)) linkedTabsByOrigin.set(originTabId, new Set());
+      const linkedSet = linkedTabsByOrigin.get(originTabId);
+      const newTabIndex = linkedSet.size + 1;
+      linkedSet.add(tabId);
+      tabIndexByTabId.set(tabId, newTabIndex);
+      console.log(`[cross-tab] Linking tab ${tabId} as tabIndex ${newTabIndex} under origin ${originTabId}`);
+      try {
+        await startRecordingOnTab(tabId);
+        chrome.storage.local.remove(storageKey).catch(() => {});
+        chrome.tabs.sendMessage(originTabId, { type: "hud_cross_tab_started", domain }).catch(() => {});
+        console.log(`[cross-tab] Recording started on tab ${tabId} (domain: ${domain})`);
+        return { ok: true };
+      } catch (err) {
+        console.error(`[cross-tab] Failed to start recording on tab ${tabId}:`, err?.message);
+        linkedTabsByOrigin.get(originTabId)?.delete(tabId);
+        tabIndexByTabId.delete(tabId);
+        return { ok: false, error: err.message };
+      }
+    }
+
+    // User chose to discard the recording without saving.
+    if (type === "discard_recording") {
+      console.log("[discard] discard_recording received, tabId:", tabId);
+      if (!tabId) return { ok: false, error: "NO_TAB" };
+      // Resolve to origin tab if this is a linked tab.
+      let originTabId = tabId;
+      for (const [origin, linked] of linkedTabsByOrigin.entries()) {
+        if (linked.has(tabId)) { originTabId = origin; break; }
+      }
+      console.log(`[discard] Discarding recording — origin tab: ${originTabId}, linked tabs:`, [...(linkedTabsByOrigin.get(originTabId) || [])]);
+      // Wipe steps before stopping so stopRecordingOnTab has nothing to merge/save.
+      stepsByTab.delete(originTabId);
+      capturedNetworkByTab.delete(originTabId);
+      for (const linkedId of (linkedTabsByOrigin.get(originTabId) || new Set())) {
+        stepsByTab.delete(linkedId);
+        capturedNetworkByTab.delete(linkedId);
+      }
+      await stopRecordingOnTab(originTabId);
+      console.log("[discard] Recording discarded successfully");
       return { ok: true };
     }
 
     if (type === "record_step") {
       if (tabId == null) return { ok: false, error: "NO_TAB" };
+      // Tag each step with the domain of the tab it was recorded on
+      let tabDomain = null;
+      try {
+        const senderTab = await chrome.tabs.get(tabId).catch(() => null);
+        if (senderTab?.url) tabDomain = new URL(senderTab.url).hostname;
+      } catch (_) {}
+      const tabIndex = tabIndexByTabId.get(tabId) ?? 0;
       const list = getStepsForTab(tabId);
-      list.push(normalizeStep(message.step || {}));
+      list.push(normalizeStep({ ...(message.step || {}), tabDomain, tabIndex }));
       // Notify HUD with updated step list
       try {
         await chrome.tabs.sendMessage(tabId, { type: "hud_recording_update", steps: [...list] });
@@ -1756,7 +2023,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       
       // Clear the replay lock
       replayLocks.delete(tabId);
-      
+      activeReplayTabId = null;
+
       // Clear badge
       await chrome.action.setBadgeText({ text: "", tabId });
       
@@ -1789,7 +2057,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       
       // Clear the replay lock to stop further execution
       replayLocks.delete(tabId);
-      
+      activeReplayTabId = null;
+
       // Clear pause state if paused
       pausedReplays.delete(tabId);
       
@@ -2115,14 +2384,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (type === "get_last_report") {
       if (tabId == null) return { ok: false, error: "NO_TAB" };
-      return { ok: true, report: lastReportByTab.get(tabId) || null };
+      const report = lastReportByTab.get(tabId)
+        // Linked tab: fall back to the origin tab's report so it gets live updates
+        || (activeReplayOriginTabId && activeReplayOriginTabId !== tabId
+            ? lastReportByTab.get(activeReplayOriginTabId)
+            : null)
+        || null;
+      return { ok: true, report };
     }
 
     if (type === "get_recording_state") {
       if (tabId == null) return { ok: false, error: "NO_TAB" };
       const isRecording = Boolean(recordingByTab.get(tabId));
       const stepsCount = getStepsForTab(tabId).length;
-      return { ok: true, isRecording, stepsCount };
+      const isReplaying = tabId === activeReplayTabId;
+      return { ok: true, isRecording, stepsCount, isReplaying, replayOriginTabId: activeReplayOriginTabId };
     }
 
     if (type === "get_steps") {
@@ -3121,11 +3397,73 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
   });
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  // Restore badge when navigation completes
-  if (changeInfo.status === 'complete' && tab.url) {
-    restoreBadgeForTab(tabId, tab.url);
+chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
+  if (changeInfo.status !== 'complete' || !tab.url) return;
+
+  restoreBadgeForTab(tabId, tab.url);
+
+  // When a recording tab navigates to a new page (e.g. JS redirect, multi-page
+  // flow, or a programmatically-opened tab that redirects after initial load),
+  // re-send recorder_start to the fresh content script so recording continues.
+  // The initial page load is NOT affected because recordingByTab is only set to
+  // true inside startRecordingOnTab, which runs after waitForTabLoad resolves —
+  // so the very first 'complete' event fires before recordingByTab is true.
+  const isHttp = tab.url.startsWith('http://') || tab.url.startsWith('https://');
+  if (!isHttp || !recordingByTab.get(tabId)) return;
+
+  const env = await getDefaultEnvironment();
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'recorder_start', env });
+  } catch {
+    // Content script may not be ready yet (document_idle can lag briefly);
+    // retry once after a short delay.
+    await new Promise(r => setTimeout(r, 300));
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: 'recorder_start', env });
+    } catch (e) {
+      console.warn('[sw] Could not re-initialize recording after navigation on tab', tabId, e?.message);
+    }
   }
+});
+
+// ── Detect new tabs opened during an active recording session ──────────
+// When a new tab opens while recording is active, show a prompt in the
+// new tab's HUD asking the user whether to record it. The user clicks
+// "Record this tab" (or ignores it). This avoids timing/redirect races
+// that broke the old auto-record approach.
+chrome.tabs.onCreated.addListener(async (tab) => {
+  // During replay the pre-registered watcher (pendingNewTabWatcher) already has
+  // a listener in place — nothing extra needed here.
+  if (replayLocks.size > 0) return;
+
+  const originTabId = [...recordingByTab.keys()].find(id => recordingByTab.get(id));
+  if (originTabId == null) return;
+  console.log(`[cross-tab] New tab ${tab.id} opened during recording on origin ${originTabId} — waiting for it to load`);
+
+  const resolvedTab = await waitForTabLoad(tab.id, 60000);
+  if (!resolvedTab?.url) {
+    console.warn(`[cross-tab] Tab ${tab.id} did not load a real URL within 60 s — ignoring`);
+    return;
+  }
+
+  if (!recordingByTab.get(originTabId)) {
+    console.log(`[cross-tab] Recording stopped on origin ${originTabId} before tab ${tab.id} loaded — ignoring`);
+    return;
+  }
+
+  let domain;
+  try { domain = new URL(resolvedTab.url).hostname; } catch {
+    console.warn(`[cross-tab] Could not parse domain from ${resolvedTab.url} — ignoring`);
+    return;
+  }
+
+  console.log(`[cross-tab] Showing "Record this tab?" prompt on tab ${tab.id} (domain: ${domain})`);
+  // Store the pending prompt so the new tab's HUD popup can read it on load.
+  await chrome.storage.local.set({ [`crossTabPrompt_${tab.id}`]: { originTabId, domain } });
+  // Show the HUD on the new tab so the prompt is visible immediately.
+  chrome.tabs.sendMessage(tab.id, { type: "hud_show" }).catch(e => console.warn(`[cross-tab] hud_show failed on tab ${tab.id}:`, e?.message));
+  // Let the origin tab's HUD know a new tab opened (informational).
+  chrome.tabs.sendMessage(originTabId, { type: "hud_cross_tab_prompt", domain }).catch(() => {});
 });
 
 // ── Clean up tab-specific storage keys when a tab is closed ──────────
@@ -3136,6 +3474,34 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     `hudMiniStatus_${tabId}`,
     `hudMinimized_${tabId}`,
     `hudIsVisible_${tabId}`,
+    `crossTabPrompt_${tabId}`,
   ];
   chrome.storage.local.remove(tabKeys).catch(() => {});
+
+  // Stop badge animation timer so it stops trying to update a closed tab
+  setRecordingBadge(tabId, false);
+
+  // If this was a linked recording tab that closed before the session ended,
+  // immediately merge its captured steps into the origin tab so they aren't lost.
+  for (const [originTabId, linked] of linkedTabsByOrigin.entries()) {
+    if (!linked.has(tabId)) continue;
+
+    const closedSteps = getStepsForTab(tabId);
+    if (closedSteps.length > 0) {
+      const originSteps = getStepsForTab(originTabId);
+      originSteps.push(...closedSteps);
+      originSteps.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    }
+
+    stepsByTab.delete(tabId);
+    capturedNetworkByTab.delete(tabId);
+    tabIndexByTabId.delete(tabId);
+    linked.delete(tabId);
+    // Keep the origin entry in linkedTabsByOrigin even if set is now empty —
+    // stopRecordingOnTab will clean it up. Removing it here was the bug.
+    break;
+  }
+
+  // If the closed tab WAS an origin (user closed the recording tab itself), clean up fully
+  linkedTabsByOrigin.delete(tabId);
 });
