@@ -297,20 +297,8 @@ async function startRecordingOnTab(tabId) {
 
   // Content script wasn't reachable — inject it only if not already present, then retry.
   try {
-    let alreadyLoaded = false;
-    try {
-      const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: () => !!window.__autotestContentLoaded });
-      alreadyLoaded = r?.result === true;
-    } catch {}
-    if (!alreadyLoaded) {
-      console.log("[sw] Injecting content scripts…");
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ["content/hud.js", "content/content.js"]
-      });
-    } else {
-      console.log("[sw] Content scripts already present, skipping injection.");
-    }
+    const injected = await ensureContentScriptsInjected(tabId);
+    console.log(injected ? "[sw] Injected content scripts…" : "[sw] Content scripts already present, skipping injection.");
     // Give the content script a moment to initialise its onMessage listener.
     await new Promise(r => setTimeout(r, 300));
     console.log("[sw] Retrying recorder_start after injection…");
@@ -574,42 +562,100 @@ function joinPaths(basePath, relPath) {
   return `/${[base, rel].filter(Boolean).join("/")}`;
 }
 
-function waitForTabComplete(tabId, timeoutMs = 30000) {
+// requireFreshLoad=true skips the "already complete" fast path and only
+// resolves on a genuine future onUpdated "complete" event. Use this whenever
+// the caller is about to (or just did) trigger a navigation itself — checking
+// tab.status synchronously right after chrome.tabs.update() is racy, since
+// Chrome hasn't always flipped status away from the *previous* page's
+// "complete" by the time we read it, which let replay treat a page as loaded
+// before it had even started navigating.
+function waitForTabComplete(tabId, timeoutMs = 30000, { requireFreshLoad = false } = {}) {
   return new Promise((resolve, reject) => {
-    // First check if tab is already complete
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      // Don't reject - some pages never fully "complete" but are usable
+      console.warn("[autotest] Navigation timeout, but continuing anyway...");
+      resolve(); // Resolve instead of reject to allow replay to continue
+    }, timeoutMs);
+
+    function finish() {
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      console.log("[autotest] Tab loaded successfully");
+      resolve();
+    }
+
+    function listener(updatedTabId, info) {
+      if (updatedTabId !== tabId) return;
+      if (info.status === "complete") finish();
+    }
+
+    // Attach the listener before any synchronous check so we never miss a
+    // transition that happens concurrently with it.
+    chrome.tabs.onUpdated.addListener(listener);
+
+    if (requireFreshLoad) return;
+
     chrome.tabs.get(tabId, (tab) => {
       if (chrome.runtime.lastError) {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
         reject(new Error(`Tab not found: ${chrome.runtime.lastError.message}`));
         return;
       }
-      
       if (tab.status === "complete") {
         console.log("[autotest] Tab already complete");
-        resolve();
-        return;
+        finish();
       }
-      
-      // Otherwise, wait for it to complete
-      const timeout = setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(listener);
-        // Don't reject - some pages never fully "complete" but are usable
-        console.warn("[autotest] Navigation timeout, but continuing anyway...");
-        resolve(); // Resolve instead of reject to allow replay to continue
-      }, timeoutMs);
-
-      function listener(updatedTabId, info) {
-        if (updatedTabId !== tabId) return;
-        if (info.status === "complete") {
-          clearTimeout(timeout);
-          chrome.tabs.onUpdated.removeListener(listener);
-          console.log("[autotest] Tab loaded successfully");
-          resolve();
-        }
-      }
-
-      chrome.tabs.onUpdated.addListener(listener);
     });
   });
+}
+
+// Poll the content script with lightweight pings until it responds, instead of
+// blindly sleeping a fixed duration. Resolves as soon as the script is alive
+// (typically well under 500ms) and only gives up after timeoutMs.
+async function waitForContentScriptAlive(tabId, { timeoutMs = 8000, intervalMs = 100 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const resp = await chrome.tabs.sendMessage(tabId, { type: "ping" });
+      if (resp?.alive) return true;
+    } catch (_) {
+      // Content script not yet listening — keep polling.
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+// content.js/hud.js are ALSO declaratively auto-injected by manifest.json on
+// every http/https page at document_idle. Re-injecting them unconditionally
+// (as several call sites used to) races with that auto-injection and, when
+// it loses the race, crashes with "Identifier 'state'/'HUD_ID' has already
+// been declared" — since top-level const/class declarations can't be
+// redeclared in the same JS realm. That crash silently aborts the ENTIRE
+// re-injected script, including whatever recovery step it was meant to
+// perform. Checking window.__autotestContentLoaded first makes this safe.
+async function ensureContentScriptsInjected(tabId, { includeHud = true } = {}) {
+  let contentLoaded = false;
+  let hudLoaded = false;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({ content: !!window.__autotestContentLoaded, hud: !!window.__autotestHudLoaded })
+    });
+    contentLoaded = r?.result?.content === true;
+    hudLoaded = r?.result?.hud === true;
+  } catch {
+    // Tab may not support scripting (e.g. chrome:// pages) — treat as not loaded.
+  }
+
+  const files = [];
+  if (includeHud && !hudLoaded) files.push("content/hud.js");
+  if (!contentLoaded) files.push("content/content.js");
+  if (files.length === 0) return false;
+  await chrome.scripting.executeScript({ target: { tabId }, files });
+  return true;
 }
 
 async function captureStepScreenshot(tabId, captureSettings, screenshots) {
@@ -1053,7 +1099,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
 
         // Re-inject content scripts and show the HUD on the tab we just switched to
         try {
-          await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js", "content/content.js"] });
+          await ensureContentScriptsInjected(activeTabId);
           await new Promise(r => setTimeout(r, 500));
         } catch (injErr) {
           console.warn("[autotest][replay] Could not inject content scripts into switched tab:", injErr?.message);
@@ -1123,11 +1169,19 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         
         const url = buildReplayUrl(stepEnv, step);
         console.log("[autotest][replay] navigation", { idx: i, url, kind: navKind });
+        // Arm the completion listener BEFORE triggering navigation so we can't
+        // miss the transition, then require a fresh "complete" event rather
+        // than trusting a possibly-stale status snapshot from the old page.
+        const tabCompletePromise = waitForTabComplete(activeTabId, 30000, { requireFreshLoad: true });
         await chrome.tabs.update(activeTabId, { url });
-        await waitForTabComplete(activeTabId);
+        await tabCompletePromise;
 
-        // Add delay to ensure content script is initialized
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Poll for the content script instead of blindly sleeping — it may be
+        // ready sooner (fast page) or later (slow bundle) than any fixed delay.
+        const scriptAlive = await waitForContentScriptAlive(activeTabId);
+        if (!scriptAlive) {
+          throw new Error("Content script did not respond after navigation.");
+        }
 
         const readyResp = await chrome.tabs.sendMessage(activeTabId, {
           type: "replay_wait_ready"
@@ -1221,28 +1275,14 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       if (!contentScriptAlive) {
         console.log(`[autotest][replay] Step ${i}: Attempting to reinject content script...`);
         try {
-          await chrome.scripting.executeScript({
-            target: { tabId: activeTabId },
-            files: ['content/content.js']
-          });
-
           // Also reinject HUD if it was enabled for this tab
           const hudState = await chrome.storage.local.get([`hudEnabled_${activeTabId}`]);
-          if (hudState[`hudEnabled_${activeTabId}`]) {
-            await chrome.scripting.executeScript({
-              target: { tabId: activeTabId },
-              files: ['content/hud.js']
-            });
-          }
-          
+          await ensureContentScriptsInjected(activeTabId, { includeHud: !!hudState[`hudEnabled_${activeTabId}`] });
+
           console.log(`[autotest][replay] Step ${i}: Content script reinjected successfully`);
-          
-          // Wait for content script to initialize
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
-          // Verify it's now alive
-          const verifyResp = await chrome.tabs.sendMessage(activeTabId, { type: "ping" });
-          if (verifyResp?.alive) {
+
+          // Poll until the reinjected script responds instead of guessing a fixed delay.
+          if (await waitForContentScriptAlive(activeTabId)) {
             console.log(`[autotest][replay] Step ${i}: Content script verified after reinjection`);
             contentScriptAlive = true;
           }
@@ -1295,10 +1335,10 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           await waitForTabComplete(activeTabId);
           await new Promise(resolve => setTimeout(resolve, 500));
 
-          // Re-inject content scripts — they are destroyed when the page navigates
+          // Re-inject content scripts if the new page's own auto-injection
+          // (via manifest.json's content_scripts) hasn't happened/landed yet.
           try {
-            await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js"] });
-            await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/content.js"] });
+            await ensureContentScriptsInjected(activeTabId);
             console.log("[autotest][replay] Re-injected content scripts after navigation");
             await new Promise(resolve => setTimeout(resolve, 300));
           } catch (injectErr) {
@@ -1413,7 +1453,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
               // Try re-injecting on second attempt
               if (attempt === 1) {
                 try {
-                  await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js", "content/content.js"] });
+                  await ensureContentScriptsInjected(activeTabId);
                   await new Promise(r => setTimeout(r, 500));
                 } catch {}
               }

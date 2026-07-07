@@ -36,7 +36,12 @@ const state = {
   inputDebounceTimer: null,
   lastClickTarget: null,
   lastClickTime: 0,
-  lastClickSentAt: 0 // Timestamp of last recorded click step (used to suppress SPA nav)
+  lastClickSentAt: 0, // Timestamp of last recorded click step (used to suppress SPA nav)
+  // Persistent (not time-windowed) per-field dedup: once a value has been
+  // recorded for a field, don't record it again unless it actually changes —
+  // even if the page re-fires input/change on that field much later (AEM
+  // commonly does this when cross-field rules re-evaluate a section).
+  lastRecordedFieldValue: new Map()
 };
 
 // ── Network interception state (block/mock/capture) ──────────────
@@ -85,9 +90,31 @@ const CLICK_TO_INPUT_WINDOW_MS = 500; // If input happens within 500ms of click,
 const DEFAULT_WAIT = {
   elementVisibleMs: 4000,
   domStableMs: 500,        // Wait for 500ms of DOM stability
-  domStableTimeoutMs: 15000, // Increased from 4s to 15s for complex pages
+  domStableTimeoutMs: 5000,
   networkIdleMs: 600,
-  networkIdleTimeoutMs: 15000 // Increased from 10s to 15s for slow networks
+  networkIdleTimeoutMs: 5000,
+  // A visible loading overlay is an explicit, unambiguous "not ready" signal
+  // from the page — unlike ambient DOM/network chatter (which many pages
+  // never fully go quiet on), so it earns a much longer, dedicated wait
+  // before we give up on it. Still best-effort: if the page's own error
+  // handling gets stuck (which does happen — e.g. an uncaught exception in
+  // its validation success callback can leave its spinner up forever), no
+  // timeout length fixes that, so we still proceed rather than aborting the
+  // whole replay over a bug we can't control from here.
+  loadingIndicatorTimeoutMs: 15000,
+  // Used by waitForPageIdle. A one-time slow backend call (e.g. a prefill
+  // lookup) usually resolves within a few seconds; perpetual chatter (a
+  // countdown timer, a bouncing "scroll down" indicator) never goes quiet no
+  // matter how long we wait. Since this is best-effort either way, a moderate
+  // ceiling catches the former without paying the full cost of the latter on
+  // every single step.
+  pageIdleTimeoutMs: 6000,
+  // How long things must stay quiet before waitForPageIdle declares the page
+  // settled. This runs before every single step, so it's a guaranteed tax on
+  // every step's latency — kept short since it only needs to catch an
+  // immediate mutation/network burst, not a slow one (a slow one still gets
+  // caught because it keeps resetting the timer for as long as it runs).
+  pageIdleQuietMs: 250
 };
 
 // ── Console error capture for assertions ──
@@ -134,6 +161,24 @@ function consumeDebugBuffer() {
 
 function markNetworkActivity() {
   networkTracker.lastActivity = performance.now();
+}
+
+// Analytics/tracking/telemetry traffic that never truly stops (beacons, pixels,
+// heartbeats) shouldn't count toward "is the page busy" — otherwise
+// waitForNetworkIdle can never find a quiet moment on a page running Adobe
+// Analytics/Target/Launch (or GA, etc.), and ends up burning its full timeout
+// on every single check.
+const NETWORK_IDLE_IGNORE_PATTERNS = [
+  /google-analytics\.com/i, /googletagmanager\.com/i, /doubleclick\.net/i,
+  /facebook\.com\/tr/i, /demdex\.net/i, /omtrdc\.net/i, /adobedtm\.com/i,
+  /2o7\.net/i, /hotjar\.com/i, /clarity\.ms/i, /nr-data\.net/i, /newrelic\.com/i,
+  /sentry\.io/i, /segment\.(io|com)/i, /mixpanel\.com/i, /amplitude\.com/i,
+  /\/b\/ss\//i
+];
+
+function isBackgroundNoiseUrl(url) {
+  const u = String(url || "");
+  return NETWORK_IDLE_IGNORE_PATTERNS.some((re) => re.test(u));
 }
 
 function patchNetworkTracking() {
@@ -188,8 +233,11 @@ function patchNetworkTracking() {
         return Promise.resolve(new Response(body, { status: mock.status || 200, headers }));
       }
 
-      networkTracker.pending += 1;
-      markNetworkActivity();
+      const isNoise = isBackgroundNoiseUrl(reqUrl);
+      if (!isNoise) {
+        networkTracker.pending += 1;
+        markNetworkActivity();
+      }
       try {
         const response = await originalFetch(...args);
         if (!response.ok) {
@@ -230,8 +278,10 @@ function patchNetworkTracking() {
         });
         throw err;
       } finally {
-        networkTracker.pending = Math.max(0, networkTracker.pending - 1);
-        markNetworkActivity();
+        if (!isNoise) {
+          networkTracker.pending = Math.max(0, networkTracker.pending - 1);
+          markNetworkActivity();
+        }
       }
     };
   }
@@ -283,8 +333,11 @@ function patchNetworkTracking() {
       return;
     }
 
-    networkTracker.pending += 1;
-    markNetworkActivity();
+    const isNoise = isBackgroundNoiseUrl(xhrUrl);
+    if (!isNoise) {
+      networkTracker.pending += 1;
+      markNetworkActivity();
+    }
     this.addEventListener(
       "loadend",
       () => {
@@ -310,18 +363,27 @@ function patchNetworkTracking() {
             capturedAt: Date.now()
           });
         }
-        networkTracker.pending = Math.max(0, networkTracker.pending - 1);
-        markNetworkActivity();
+        if (!isNoise) {
+          networkTracker.pending = Math.max(0, networkTracker.pending - 1);
+          markNetworkActivity();
+        }
       },
       { once: true }
     );
     return originalSend.apply(this, args);
   };
 
-  // Track resource entries when available (best-effort).
+  // Track resource entries when available (best-effort). Only count types that
+  // actually reflect app data-loading (scripts, fetch/xhr) — images, CSS,
+  // fonts, and tracking pixels load continuously on most real pages and would
+  // otherwise make the page look "busy" forever.
   try {
+    const MEANINGFUL_INITIATOR_TYPES = new Set(["script", "fetch", "xmlhttprequest"]);
     const observer = new PerformanceObserver((list) => {
-      if (list.getEntries().length > 0) markNetworkActivity();
+      const hasMeaningfulActivity = list.getEntries().some((entry) =>
+        MEANINGFUL_INITIATOR_TYPES.has(entry.initiatorType) && !isBackgroundNoiseUrl(entry.name)
+      );
+      if (hasMeaningfulActivity) markNetworkActivity();
     });
     observer.observe({ entryTypes: ["resource"] });
   } catch {
@@ -345,6 +407,30 @@ function dedupeKey({ type, selector, value, relativePath, queryParams }) {
 }
 
 function isDuplicate(step) {
+  // Value-carrying steps (input/change) get a permanent per-field dedup keyed
+  // only on selector+value — NOT on step.type. Without this, a debounced
+  // "input" step and a later "change" step for the same field with the same
+  // (unchanged) value are treated as distinct events (dedupeKey includes
+  // type), producing the duplicate INPUT-then-CHANGE pairs seen in practice
+  // when AEM re-fires change on an already-filled field during a re-render.
+  if ((step.type === "input" || step.type === "change") && step.value !== undefined) {
+    const fieldKey = `${step.selector?.primary?.value || ""}::${step.relativePath || ""}`;
+    const isDup = state.lastRecordedFieldValue.get(fieldKey) === step.value;
+    console.log("[autotest][record][dedupe-check]", {
+      type: step.type,
+      value: step.value,
+      fieldKey,
+      previousValueForThisFieldKey: state.lastRecordedFieldValue.get(fieldKey) ?? null,
+      decision: isDup ? "SKIPPED as duplicate" : "recorded"
+    });
+    if (isDup) return true;
+    state.lastRecordedFieldValue.set(fieldKey, step.value);
+    return false;
+  }
+
+  // Everything else (click, submit, navigation, asserts) uses the short
+  // time-windowed dedup — it only needs to guard against a genuine double
+  // fire of the same discrete event, not a delayed re-fire.
   const key = dedupeKey(step);
   const now = Date.now();
   state.recentEvents = state.recentEvents.filter((e) => now - e.time < DEDUPE_WINDOW_MS);
@@ -468,6 +554,29 @@ function buildXPath(el) {
     node = node.parentElement;
   }
   return `/${segments.join("/")}`;
+}
+
+// Checks whether a CSS selector resolves to exactly one element matching
+// `el`, right now. Counts only VISIBLE matches when el itself is visible —
+// AEM (and other frameworks) commonly leave hidden template/clone markup
+// around with identical attributes to the real, interactable element, which
+// would otherwise make an actually-unique-for-the-user's-purposes selector
+// look ambiguous by a raw querySelectorAll().length check.
+function isUniqueMatchFor(el, cssValue) {
+  let matches;
+  try {
+    matches = document.querySelectorAll(cssValue);
+  } catch {
+    return false;
+  }
+  if (matches.length === 0) return false;
+  if (isElementVisible(el)) {
+    const visibleMatches = Array.from(matches).filter(isElementVisible);
+    if (visibleMatches.length > 0) {
+      return visibleMatches.length === 1 && visibleMatches[0] === el;
+    }
+  }
+  return matches.length === 1 && matches[0] === el;
 }
 
 function generateSelector(el) {
@@ -648,8 +757,25 @@ function generateSelector(el) {
     });
   }
 
-  const [primary, ...fallbacks] = candidates;
-  
+  // Prefer candidates that uniquely resolve to THIS element right now. A
+  // selector like [aria-labelledby="..."] can be shared by several sibling
+  // fields (e.g. a composite day/month/year date input where all three
+  // sub-inputs point at the same shared error-description id) — without this
+  // check, that non-unique selector can still end up as primary just because
+  // it was pushed earlier, and querySelector will always resolve it to
+  // whichever sibling comes first in DOM order, silently misdirecting every
+  // step meant for the other siblings (e.g. month/year steps landing on day).
+  const uniqueCss = [];
+  const nonUniqueCss = [];
+  const nonCss = [];
+  for (const c of candidates) {
+    if (c.type !== "css") { nonCss.push(c); continue; }
+    (isUniqueMatchFor(el, c.value) ? uniqueCss : nonUniqueCss).push(c);
+  }
+  const orderedCandidates = [...uniqueCss, ...nonUniqueCss, ...nonCss];
+
+  const [primary, ...fallbacks] = orderedCandidates;
+
   return { primary: primary || null, fallbacks };
 }
 
@@ -1886,110 +2012,91 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
   }
   if (looseFallbacks.length) candidates.push(...looseFallbacks);
 
-  const selectorAttempts = [];
-  
-  
+  // Validate CSS candidates once up front, not on every poll tick.
+  const validCandidates = candidates.filter((candidate) => {
+    if (candidate?.type !== "css") return true;
+    try {
+      document.querySelectorAll(candidate.value);
+      return true;
+    } catch (err) {
+      console.warn(`[autotest][replay] ✗ Invalid CSS selector, skipping:`, candidate.value, err.message);
+      return false;
+    }
+  });
+
   console.log("[autotest][replay] Trying selectors:", {
-    total: candidates.length,
+    total: validCandidates.length,
     primary: selector.primary?.value || selector.primary?.type,
     fallbackCount: selector.fallbacks?.length || 0
   });
-  
-  // Give each candidate a reduced timeout so all can be tried
-  // Primary gets more time, fallbacks get less
-  const primaryTimeoutMs = Math.min(timeoutMs, 3000);
-  const fallbackTimeoutMs = 1000;
-  
-  for (let candidateIdx = 0; candidateIdx < candidates.length; candidateIdx++) {
-    const candidate = candidates[candidateIdx];
-    const candidateTimeout = candidateIdx === 0 ? primaryTimeoutMs : fallbackTimeoutMs;
-    let attempted = false;
-    let lastFoundElement = null;
-    let invalidSelector = false;
-    
-    console.log(`[autotest][replay] Attempt ${candidateIdx + 1}/${candidates.length}:`, {
-      type: candidate?.type,
-      value: candidate?.value?.substring?.(0, 100),
-      reason: candidate?.reason,
-      timeoutMs: candidateTimeout
-    });
-    
-    // Try to validate CSS selector before polling
-    if (candidate?.type === "css") {
-      try {
-        document.querySelectorAll(candidate.value);
-      } catch (err) {
-        console.warn(`[autotest][replay] ✗ Invalid CSS selector, skipping:`, candidate.value, err.message);
-        invalidSelector = true;
-        selectorAttempts.push({
-          candidate,
-          found: false,
-          visible: false,
-          timestamp: Date.now(),
-          error: "Invalid CSS selector"
-        });
-      }
-    }
-    
-    // Skip this candidate if it's invalid
-    if (invalidSelector) continue;
-    
-    const candidateStart = performance.now();
-    while (performance.now() - candidateStart < candidateTimeout) {
+
+  // Check every candidate on every poll tick (instead of exhausting the
+  // primary candidate's own timeout before even trying a fallback). If the
+  // primary selector never matches, a working fallback still resolves within
+  // one poll interval instead of after several seconds of wasted waiting.
+  const selectorAttempts = [];
+  let bestHidden = null; // first found-but-not-yet-visible match, kept as a fallback result
+
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    let firstVisible = null; // first visible match, in candidate priority order — used if none are unique
+    for (const candidate of validCandidates) {
       const el = resolveBySelectorCandidate(candidate);
-      if (el) {
-        lastFoundElement = el;
-        if (isElementVisible(el)) {
-          console.log(`[autotest][replay] ✓ Selector matched (visible):`, {
-            candidateIdx,
+      if (!el) continue;
+      if (isElementVisible(el)) {
+        // A recorded selector can be shared by several sibling elements (e.g.
+        // a composite date field where day/month/year all point at the same
+        // aria-labelledby). If this candidate resolves to exactly one element
+        // right now, trust it immediately — don't let an earlier, ambiguous
+        // candidate (which also happens to be visible) win just because it's
+        // first in priority order.
+        // Use the same visibility-aware uniqueness check as generateSelector —
+        // a raw querySelectorAll().length count would wrongly reject a
+        // genuinely-unique-for-the-user's-purposes selector whenever AEM (or
+        // similar frameworks) leave a hidden template/clone element around
+        // with identical attributes, sending resolution all the way down to
+        // the brittle XPath fallback for no real reason.
+        const isUnique = candidate.type !== "css" || isUniqueMatchFor(el, candidate.value);
+        if (isUnique) {
+          console.log(`[autotest][replay] ✓ Selector matched (visible, unique):`, {
             type: candidate?.type,
             value: candidate?.value?.substring?.(0, 100)
           });
-          selectorAttempts.push({
-            candidate,
-            found: true,
-            visible: true,
-            timestamp: Date.now()
-          });
+          selectorAttempts.push({ candidate, found: true, visible: true, timestamp: Date.now() });
           return { el, used: candidate, selectorAttempts, visible: true };
         }
+        if (!firstVisible) firstVisible = { el, candidate };
+      } else if (!bestHidden) {
+        bestHidden = { el, candidate };
       }
-      attempted = true;
-      await nextFrame();
     }
-    
-    // After timeout: if we found an element but it never became visible,
-    // return it anyway (some interactions work on hidden elements)
-    if (lastFoundElement) {
-      console.log(`[autotest][replay] ⚠ Selector matched (hidden):`, {
-        candidateIdx,
-        type: candidate?.type,
-        value: candidate?.value?.substring?.(0, 100)
+    // No candidate uniquely matched this tick — fall back to the first
+    // visible match in priority order, same as before this uniqueness check.
+    if (firstVisible) {
+      console.log(`[autotest][replay] ✓ Selector matched (visible, ambiguous — no unique candidate available):`, {
+        type: firstVisible.candidate?.type,
+        value: firstVisible.candidate?.value?.substring?.(0, 100)
       });
-      selectorAttempts.push({
-        candidate,
-        found: true,
-        visible: false,
-        timestamp: Date.now()
-      });
-      return { el: lastFoundElement, used: candidate, selectorAttempts, visible: false };
+      selectorAttempts.push({ candidate: firstVisible.candidate, found: true, visible: true, timestamp: Date.now() });
+      return { el: firstVisible.el, used: firstVisible.candidate, selectorAttempts, visible: true };
     }
-    
-    if (attempted) {
-      console.log(`[autotest][replay] ✗ Selector failed:`, {
-        candidateIdx,
-        type: candidate?.type,
-        value: candidate?.value?.substring?.(0, 100)
-      });
-      selectorAttempts.push({
-        candidate,
-        found: false,
-        visible: false,
-        timestamp: Date.now()
-      });
-    }
+    await nextFrame();
   }
-  
+
+  // Nothing became visible within the timeout — if something matched but
+  // stayed hidden, return it anyway (some interactions work on hidden elements).
+  if (bestHidden) {
+    console.log(`[autotest][replay] ⚠ Selector matched (hidden):`, {
+      type: bestHidden.candidate?.type,
+      value: bestHidden.candidate?.value?.substring?.(0, 100)
+    });
+    selectorAttempts.push({ candidate: bestHidden.candidate, found: true, visible: false, timestamp: Date.now() });
+    return { el: bestHidden.el, used: bestHidden.candidate, selectorAttempts, visible: false };
+  }
+
+  for (const candidate of validCandidates) {
+    selectorAttempts.push({ candidate, found: false, visible: false, timestamp: Date.now() });
+  }
   console.log("[autotest][replay] All selectors exhausted. No element found.");
   return { el: null, used: null, selectorAttempts, visible: false };
 }
@@ -2005,7 +2112,7 @@ async function waitForDOMStable({
   stableMs = DEFAULT_WAIT.domStableMs,
   timeoutMs = DEFAULT_WAIT.domStableTimeoutMs
 } = {}) {
-  let lastMutation = performance.now() - stableMs; // treat as already stable until a mutation fires
+  let lastMutation = performance.now(); // must observe a real quiet period before declaring stable
   const observer = new MutationObserver(() => {
     lastMutation = performance.now();
   });
@@ -2045,6 +2152,153 @@ async function waitForNetworkIdle({
     await nextFrame();
   }
   return { ok: false, error: "Network did not become idle within timeout." };
+}
+
+// Generic patterns for app-rendered loading overlays/spinners. A spinner is
+// often just a static SVG/icon with a CSS animation — once inserted it stops
+// triggering DOM mutations, so waitForDOMStable alone can't detect it. This
+// catches the case where a loader appears *after* the page already looked
+// quiet (e.g. a delayed data fetch that re-renders the form a few seconds
+// after initial load).
+const LOADING_INDICATOR_SELECTORS = [
+  '[aria-busy="true"]',
+  '[role="progressbar"]',
+  '[class*="spinner" i]',
+  '[class*="loader" i]',
+  '[class*="loading" i]',
+  '[class*="overlay" i]',
+  '[class*="backdrop" i]',
+  '[class*="blockui" i]',
+  '[class*="busy" i]'
+];
+
+// Name-agnostic backstop: a large, high-z-index, fixed/absolute element
+// covering most of the viewport is very likely a blocking overlay regardless
+// of what it's actually called — e.g. jQuery's blockUI plugin (common on
+// older AEM/jQuery forms) names its overlay ".blockOverlay"/".blockMsg",
+// which none of the class-name patterns above account for. Requiring large
+// coverage + high z-index keeps this from matching normal fixed headers,
+// cookie banners, etc.
+function isLikelyBlockingOverlay(el) {
+  if (!el || !isElementVisible(el)) return false;
+  const style = window.getComputedStyle(el);
+  if (style.position !== "fixed" && style.position !== "absolute") return false;
+  const rect = el.getBoundingClientRect();
+  const viewportArea = window.innerWidth * window.innerHeight;
+  if (viewportArea <= 0) return false;
+  const coverage = (rect.width * rect.height) / viewportArea;
+  if (coverage < 0.6) return false;
+  const zIndex = parseInt(style.zIndex, 10);
+  if (Number.isNaN(zIndex) || zIndex < 100) return false;
+  return true;
+}
+
+function findVisibleLoadingIndicator() {
+  for (const sel of LOADING_INDICATOR_SELECTORS) {
+    let els;
+    try {
+      els = document.querySelectorAll(sel);
+    } catch (_) {
+      continue; // Some browsers may not support the "i" case-insensitive flag.
+    }
+    for (const el of els) {
+      if (isExtensionUiTarget(el)) continue; // Ignore our own HUD/panel.
+      if (isElementVisible(el)) return el;
+    }
+  }
+
+  // Fall back to the name-agnostic overlay heuristic, checked over a bounded
+  // set of candidates (elements with a non-static position, which is most of
+  // what modals/overlays/loaders use) rather than every element on the page.
+  try {
+    const candidates = document.querySelectorAll('div, section, aside');
+    for (const el of candidates) {
+      if (isExtensionUiTarget(el)) continue;
+      if (isLikelyBlockingOverlay(el)) return el;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+async function waitForNoLoadingIndicator({
+  timeoutMs = DEFAULT_WAIT.loadingIndicatorTimeoutMs
+} = {}) {
+  const start = performance.now();
+  while (performance.now() - start < timeoutMs) {
+    const indicator = findVisibleLoadingIndicator();
+    if (!indicator) return { ok: true };
+    await nextFrame();
+  }
+  return { ok: false, error: "A loading indicator is still visible after timeout." };
+}
+
+// Runs the DOM/network/loader checks as ONE continuous poll loop instead of
+// three sequential ones. Calling waitForDOMStable() then waitForNetworkIdle()
+// then waitForNoLoadingIndicator() back-to-back leaves gaps where nothing is
+// actively watching — e.g. a delayed prefill fetch that starts right in the
+// gap between two of those calls (or right after the last one returns) slips
+// through undetected. Here all three signals are re-checked every frame for
+// the whole window, so something that starts a few seconds in still resets
+// the "quiet" timer and gets waited out.
+async function waitForPageIdle({
+  quietMs = DEFAULT_WAIT.pageIdleQuietMs,
+  timeoutMs = DEFAULT_WAIT.pageIdleTimeoutMs,
+  loaderTimeoutMs = DEFAULT_WAIT.loadingIndicatorTimeoutMs
+} = {}) {
+  // Phase 1: a visible loading overlay gets its own dedicated, longer wait,
+  // separate from (and before) the fast ambient DOM/network quiet check
+  // below. It's a much stronger "not ready" signal than background chatter,
+  // so it deserves more patience — but still best-effort: if the page's own
+  // error handling gets stuck and the loader never clears, we proceed anyway
+  // rather than aborting the whole replay over a bug outside our control.
+  const loaderResult = await waitForNoLoadingIndicator({ timeoutMs: loaderTimeoutMs });
+  if (!loaderResult.ok) return loaderResult;
+
+  patchNetworkTracking();
+  const root = document.documentElement;
+  let lastUnsettled = performance.now();
+  const observer = new MutationObserver((mutations) => {
+    // Ignore mutations that are just network-tracker-main.js reporting its
+    // own state — those are handled explicitly via mainWorldBusy below, and
+    // double-counting them here doesn't add signal, just noise in the diff.
+    const realMutation = mutations.some((m) =>
+      !(m.type === "attributes" && m.target === root &&
+        (m.attributeName === "data-autotest-net-pending" || m.attributeName === "data-autotest-net-last-activity"))
+    );
+    if (realMutation) lastUnsettled = performance.now();
+  });
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    characterData: true
+  });
+
+  const start = performance.now();
+  try {
+    while (performance.now() - start < timeoutMs) {
+      const now = performance.now();
+      // networkTracker only sees fetch/XHR calls the extension's own isolated
+      // world makes — it can't see the page's real network calls (those run
+      // in the MAIN world, a separate JS realm with its own fetch/XHR).
+      // network-tracker-main.js patches the real ones and reports back via
+      // DOM attributes, which (unlike JS state) are visible across worlds.
+      const isolatedWorldBusy = networkTracker.pending > 0 || (now - networkTracker.lastActivity) < quietMs;
+      const mainWorldPending = Number(root.getAttribute("data-autotest-net-pending") || "0");
+      const mainWorldLastActivity = Number(root.getAttribute("data-autotest-net-last-activity") || "0");
+      const mainWorldBusy = mainWorldPending > 0 || (mainWorldLastActivity && (Date.now() - mainWorldLastActivity) < quietMs);
+      const loaderVisible = !!findVisibleLoadingIndicator();
+      if (isolatedWorldBusy || mainWorldBusy || loaderVisible) {
+        lastUnsettled = now;
+      }
+      if (now - lastUnsettled >= quietMs) return { ok: true };
+      await nextFrame();
+    }
+    return { ok: false, error: "Page did not settle (DOM/network/loading indicator) within timeout." };
+  } finally {
+    observer.disconnect();
+  }
 }
 
 /**
@@ -2324,9 +2578,16 @@ async function performStep(step) {
     return { ok: true, debug: consumeDebugBuffer() };
   }
 
-  const domStable = await waitForDOMStable();
-  if (!domStable.ok) {
-    return { ok: false, error: domStable.error, code: "DOM_UNSTABLE", debug: consumeDebugBuffer() };
+  // Gate every step (not just navigation) on the form being genuinely idle —
+  // no pending mutations, no in-flight requests, no visible loader — before
+  // we touch it. This catches both the previous step kicking off an async
+  // validation call, and a delayed fetch (e.g. a prefill lookup) that starts
+  // a moment after the page first looked quiet. Best-effort: some pages never
+  // go fully quiet (animated loaders, analytics beacons), so wait up to the
+  // timeout and proceed anyway rather than aborting the whole replay.
+  const pageIdle = await waitForPageIdle();
+  if (!pageIdle.ok) {
+    console.warn("[autotest][replay] Page never fully settled before step, continuing:", pageIdle.error);
   }
 
   // ============================================================================
@@ -2850,17 +3111,9 @@ async function performStep(step) {
       }
     }
     
-    // Wait for DOM and network to stabilize, but don't fail if they don't
-    const postDom = await waitForDOMStable();
-    const postNet = await waitForNetworkIdle();
-    
-    if (!postDom.ok) {
-      console.warn("[autotest][replay] DOM still updating after click, continuing anyway");
-    }
-    if (!postNet.ok) {
-      console.warn("[autotest][replay] Network still active after click, continuing anyway");
-    }
-    
+    // No post-action wait here — the next step's own pre-step gate in
+    // performStep() already waits for the page to settle before it acts, so
+    // waiting again here would just pay the same quiet-period cost twice.
     return {
       ok: true,
       meta: { usedSelector: used },
@@ -2952,11 +3205,7 @@ async function performStep(step) {
         el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       }
       
-      const postDom = await waitForDOMStable();
-      if (!postDom.ok) {
-        console.warn("[autotest][replay] DOM still updating after radio/checkbox click, continuing");
-      }
-      
+      // No post-action wait — the next step's pre-step gate covers this.
       return {
         ok: true,
         meta: { usedSelector: used },
@@ -3014,8 +3263,7 @@ async function performStep(step) {
         } catch (e) { /* ignore */ }
       }
       
-      const postDom = await waitForDOMStable();
-      if (!postDom.ok) console.warn("[autotest][replay] DOM still updating after custom toggle click");
+      // No post-action wait — the next step's pre-step gate covers this.
       return {
         ok: true,
         meta: { usedSelector: used },
@@ -3039,10 +3287,7 @@ async function performStep(step) {
       }
       el.dispatchEvent(new Event("change", { bubbles: true }));
       el.dispatchEvent(new Event("input", { bubbles: true }));
-      const postDom = await waitForDOMStable();
-      if (!postDom.ok) {
-        console.warn("[autotest][replay] DOM still updating after select change, continuing");
-      }
+      // No post-action wait — the next step's pre-step gate covers this.
       return {
         ok: true,
         meta: { usedSelector: used },
@@ -3093,12 +3338,10 @@ async function performStep(step) {
     el.dispatchEvent(new Event("change", { bubbles: true }));
     el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
 
-    // Wait for DOM to stabilize, but don't fail if it doesn't
-    const postDom = await waitForDOMStable();
-    if (!postDom.ok) {
-      console.warn("[autotest][replay] DOM still updating after input, continuing anyway");
-    }
-    
+    // No post-action wait — the next step's pre-step gate covers this
+    // (typing/blurring a field commonly triggers a debounced validation call,
+    // e.g. OTP/PAN/pincode lookups, same as a click can).
+
     return {
       ok: true,
       meta: { usedSelector: used },
@@ -3547,6 +3790,22 @@ function learnFromRecordedStep(step) {
 function makeStep(type, target, value) {
   const { relativePath, queryParams } = computeRelativeLocation(window.location.href, state.baseUrl);
   let selector = generateSelector(target);
+  console.log("[autotest][record][selector]", {
+    type,
+    value,
+    target: target ? {
+      tag: target.tagName?.toLowerCase(),
+      id: target.id || null,
+      name: target.getAttribute?.('name') || null,
+      placeholder: target.getAttribute?.('placeholder') || null,
+      ariaLabel: target.getAttribute?.('aria-label') || null,
+      ariaLabelledby: target.getAttribute?.('aria-labelledby') || null,
+      classes: target.className || null
+    } : null,
+    primary: selector?.primary ? { type: selector.primary.type, value: selector.primary.value, reason: selector.primary.reason } : null,
+    fallbackCount: selector?.fallbacks?.length || 0,
+    fallbacks: (selector?.fallbacks || []).map(f => ({ type: f.type, value: f.value }))
+  });
   let matchInfo = null;
   
   // Extract element name/label for display
@@ -4073,9 +4332,21 @@ function handleClick(event) {
     const clickTime = Date.now();
     state.lastClickTarget = target;
     state.lastClickTime = clickTime;
-    
+    console.log("[autotest][record][click-scheduled]", {
+      tag: tagName,
+      name: target.getAttribute?.('name') || null,
+      placeholder: target.getAttribute?.('placeholder') || null,
+      windowMs: CLICK_TO_INPUT_WINDOW_MS
+    });
+
     setTimeout(() => {
       if (state.lastClickTarget === target && state.lastClickTime === clickTime) {
+        console.log("[autotest][record][click-FIRED]", {
+          tag: tagName,
+          name: target.getAttribute?.('name') || null,
+          placeholder: target.getAttribute?.('placeholder') || null,
+          reason: "no input event cancelled it within the window — recorded as a CLICK step"
+        });
         flushPendingInput();
         sendStep(makeStep("click", target));
         state.lastClickSentAt = Date.now();
@@ -4114,20 +4385,46 @@ function handleInput(event) {
   // Check if this input is on the element we just clicked
   const timeSinceClick = Date.now() - state.lastClickTime;
   const isSameAsClickedElement = state.lastClickTarget === target;
-  
+
   // If input happens shortly after clicking the same element, cancel the pending click
   if (isSameAsClickedElement && timeSinceClick < CLICK_TO_INPUT_WINDOW_MS) {
+    console.log("[autotest][record][click-cancelled]", {
+      tag: target.tagName?.toLowerCase(),
+      name: target.getAttribute?.('name') || null,
+      placeholder: target.getAttribute?.('placeholder') || null,
+      timeSinceClick
+    });
     state.lastClickTarget = null;
     state.lastClickTime = 0;
+  } else if (state.lastClickTarget && !isSameAsClickedElement) {
+    console.log("[autotest][record][click-NOT-cancelled — different target]", {
+      inputTag: target.tagName?.toLowerCase(),
+      inputName: target.getAttribute?.('name') || null,
+      inputPlaceholder: target.getAttribute?.('placeholder') || null,
+      clickedTag: state.lastClickTarget.tagName?.toLowerCase?.() || null,
+      clickedName: state.lastClickTarget.getAttribute?.('name') || null,
+      clickedPlaceholder: state.lastClickTarget.getAttribute?.('placeholder') || null,
+      note: "the pending click was scheduled for a DIFFERENT element than this input — it will still fire as its own CLICK step"
+    });
   }
   
   const step = makeStep(event.type, target, target.value);
-  
+
   // Check if this is input on the same field as pending step
-  const sameField = state.pendingInputStep && 
+  const sameField = state.pendingInputStep &&
     state.pendingInputStep.selector?.primary?.value === step.selector?.primary?.value &&
     state.pendingInputStep.relativePath === step.relativePath;
-  
+
+  console.log("[autotest][record][merge-check]", {
+    eventType: event.type,
+    newValue: step.value,
+    newPrimarySelector: step.selector?.primary?.value || null,
+    pendingValue: state.pendingInputStep?.value ?? null,
+    pendingPrimarySelector: state.pendingInputStep?.selector?.primary?.value || null,
+    sameField,
+    decision: sameField ? "MERGED into pending step (value overwritten, no new step)" : "NEW pending step (previous one flushed if any)"
+  });
+
   if (sameField) {
     // Update pending step with new value instead of creating new step
     state.pendingInputStep.value = step.value;
@@ -4244,6 +4541,7 @@ async function startRecording(envOverride) {
   // fetched the environment and passed it through.
   state.env = envOverride || null;
   state.baseUrl = getEnvironmentBaseUrl(state.env);
+  state.lastRecordedFieldValue.clear();
   state.isRecording = true;
   console.log("[autotest][content] Recording started, env:", state.env?.name || "(none)");
 }
@@ -4261,6 +4559,15 @@ function stopRecording() {
 // ── Keyboard recording ──────────────────────────────────────
 const SPECIAL_KEYS = new Set(['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']);
 const MODIFIER_COMBOS = new Set(['a', 'c', 'v', 'x', 'z', 's', 'f']); // Ctrl/Cmd + key
+// Backspace/Delete while actively typing in a text field are pure
+// self-corrections — the *next* input event already reflects the edited
+// value. Recording them as their own step (which flushes whatever was typed
+// so far first) fragments one edit into many: typing "adi", backspacing, and
+// retyping "agarwal" becomes 5+ separate recorded steps instead of one final
+// "agarwal". Replaying all of those fires the page's own field validation
+// repeatedly in rapid succession — much faster than the user actually typed —
+// which some forms' async validation can't handle cleanly.
+const TEXT_CORRECTION_KEYS = new Set(['Backspace', 'Delete']);
 
 function handleKeyDown(event) {
   if (!state.isRecording) return;
@@ -4281,6 +4588,14 @@ function handleKeyDown(event) {
     // Only record Tab if the user isn't currently typing in an input
     const tag = event.target.tagName?.toLowerCase();
     if (tag === 'input' || tag === 'textarea') return;
+  }
+
+  // Don't record/flush Backspace or Delete while actively editing a text
+  // field — let it be absorbed into the ongoing typing session instead (see
+  // TEXT_CORRECTION_KEYS above).
+  if (TEXT_CORRECTION_KEYS.has(key) && !hasModifier) {
+    const tag = event.target.tagName?.toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || event.target.isContentEditable) return;
   }
 
   flushPendingInput();
@@ -4641,10 +4956,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "replay_wait_ready") {
     Promise.resolve()
       .then(async () => {
-        const dom = await waitForDOMStable();
-        if (!dom.ok) return { ok: false, error: dom.error, code: "DOM_UNSTABLE" };
-        const net = await waitForNetworkIdle();
-        if (!net.ok) return { ok: false, error: net.error, code: "NETWORK_BUSY" };
+        // Best-effort: some pages never go fully quiet (animated loaders,
+        // analytics beacons, keep-alive pings). Wait up to the timeout for
+        // real idle, but don't abort the whole replay if it never arrives —
+        // just proceed with a warning, same as the post-action waits do.
+        const pageIdle = await waitForPageIdle();
+        if (!pageIdle.ok) console.warn("[autotest][replay] Page never fully settled post-navigation, continuing:", pageIdle.error);
         return { ok: true };
       })
       .then((resp) => sendResponse(resp))

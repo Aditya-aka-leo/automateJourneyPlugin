@@ -34,6 +34,12 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
+      "js": ["content/network-tracker-main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["http://*/*", "https://*/*"],
       "js": ["content/hud.js", "content/content.js"],
       "run_at": "document_idle"
     }
