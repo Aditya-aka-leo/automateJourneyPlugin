@@ -1299,7 +1299,12 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       console.log(`[autotest][replay] Step ${i}: Sending message to content script...`);
 
       let resp;
-      const stepTimeoutMs = 30000; // 30s max per step
+      // Must exceed content.js's own internal waits (up to 10 minutes for a
+      // slow-loading popup's target element / loading indicator, see
+      // DEFAULT_WAIT in content.js) plus a buffer, so this outer guard never
+      // fires first and masks the more specific ELEMENT_NOT_FOUND /
+      // LOADING_INDICATOR_TIMEOUT failure content.js would otherwise report.
+      const stepTimeoutMs = 660000; // 11 minutes max per step
       try {
         const sendStartTime = Date.now();
         resp = await Promise.race([
@@ -1309,7 +1314,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
             env: stepEnv,
             healingConfig: selectorHealing
           }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error("Step execution timed out after 30s")), stepTimeoutMs))
+          new Promise((_, rej) => setTimeout(() => rej(new Error(`Step execution timed out after ${stepTimeoutMs / 1000}s`)), stepTimeoutMs))
         ]);
         const sendDuration = Date.now() - sendStartTime;
         

@@ -88,20 +88,26 @@ const DEDUPE_WINDOW_MS = 350;
 const INPUT_DEBOUNCE_MS = 1000;
 const CLICK_TO_INPUT_WINDOW_MS = 500; // If input happens within 500ms of click, merge them
 const DEFAULT_WAIT = {
-  elementVisibleMs: 4000,
+  // How long to wait for a step's target element to appear/become visible
+  // before giving up on it. A slow-rendering popup (async data fetch,
+  // multi-hop panel animation, etc.) can legitimately take a while to put
+  // its fields on screen — this is deliberately generous (10 minutes) so we
+  // never guess wrong just because we didn't wait long enough. If the
+  // element still never appears within this window, performStep() reports
+  // ELEMENT_NOT_FOUND, which aborts the whole replay (see sw.js) rather than
+  // silently proceeding against a page that isn't ready.
+  elementVisibleMs: 600000,
   domStableMs: 500,        // Wait for 500ms of DOM stability
   domStableTimeoutMs: 5000,
   networkIdleMs: 600,
   networkIdleTimeoutMs: 5000,
-  // A visible loading overlay is an explicit, unambiguous "not ready" signal
-  // from the page — unlike ambient DOM/network chatter (which many pages
-  // never fully go quiet on), so it earns a much longer, dedicated wait
-  // before we give up on it. Still best-effort: if the page's own error
-  // handling gets stuck (which does happen — e.g. an uncaught exception in
-  // its validation success callback can leave its spinner up forever), no
-  // timeout length fixes that, so we still proceed rather than aborting the
-  // whole replay over a bug we can't control from here.
-  loadingIndicatorTimeoutMs: 15000,
+  // A visible loading overlay/popup-loader is an explicit, unambiguous "not
+  // ready" signal from the page, so it gets the same 10-minute patience as
+  // element-visibility above. Unlike before, exhausting this window is now a
+  // hard failure (see waitForPageIdle's caller in performStep) instead of a
+  // best-effort "warn and continue" — proceeding against a page that never
+  // finished loading risks silently interacting with the wrong state.
+  loadingIndicatorTimeoutMs: 600000,
   // Used by waitForPageIdle. A one-time slow backend call (e.g. a prefill
   // lookup) usually resolves within a few seconds; perpetual chatter (a
   // countdown timer, a bouncing "scroll down" indicator) never goes quiet no
@@ -2166,10 +2172,22 @@ const LOADING_INDICATOR_SELECTORS = [
   '[class*="spinner" i]',
   '[class*="loader" i]',
   '[class*="loading" i]',
-  '[class*="overlay" i]',
-  '[class*="backdrop" i]',
   '[class*="blockui" i]',
   '[class*="busy" i]'
+];
+
+// "overlay"/"backdrop" class names are ambiguous: they match real blocking
+// loaders (a custom "loading-overlay" div) but also the dimming layer that
+// legitimate modals/dialogs render behind themselves — jQuery UI's
+// .ui-widget-overlay, Bootstrap's .modal-backdrop, etc. When a dialog is
+// genuinely open, that backdrop staying visible for as long as the user is
+// filling in fields inside it is expected, not a "still loading" signal.
+// These patterns are only trusted when getOpenDialog() finds no open dialog
+// (see findVisibleLoadingIndicator) — unlike a "loaderPanel"-style false
+// positive, a real backdrop has no form content of its own to filter on.
+const OVERLAY_INDICATOR_SELECTORS = [
+  '[class*="overlay" i]',
+  '[class*="backdrop" i]'
 ];
 
 // Name-agnostic backstop: a large, high-z-index, fixed/absolute element
@@ -2190,7 +2208,24 @@ function isLikelyBlockingOverlay(el) {
   if (coverage < 0.6) return false;
   const zIndex = parseInt(style.zIndex, 10);
   if (Number.isNaN(zIndex) || zIndex < 100) return false;
+  if (containsInteractiveFormContent(el)) return false;
   return true;
+}
+
+// A genuine loading spinner/overlay is decorative — it never contains actual
+// form controls the user needs to interact with. Some apps' popup/panel
+// containers happen to carry a "loader"/"loading"/"overlay"-named class for
+// unrelated reasons (transition/animation styling, legacy naming, etc.) —
+// e.g. an AEM Forms guide popup panel named "...FormPopupPanel loaderPanel"
+// that holds real input fields and a submit button. Class-name matching alone
+// can't tell these apart, but content can: if the "loader" candidate contains
+// real interactive controls, it's a content panel, not a blocking loader.
+function containsInteractiveFormContent(el) {
+  try {
+    return !!el.querySelector('input, textarea, select, button, a[href]');
+  } catch (_) {
+    return false;
+  }
 }
 
 function findVisibleLoadingIndicator() {
@@ -2203,7 +2238,32 @@ function findVisibleLoadingIndicator() {
     }
     for (const el of els) {
       if (isExtensionUiTarget(el)) continue; // Ignore our own HUD/panel.
-      if (isElementVisible(el)) return el;
+      if (!isElementVisible(el)) continue;
+      if (containsInteractiveFormContent(el)) continue;
+      return el;
+    }
+  }
+
+  // A genuinely open dialog/modal explains any overlay/backdrop-shaped
+  // element on the page — it's the dialog's own dimming layer, not a
+  // blocking loader. Treating it as one here would make every step
+  // targeting fields inside the dialog wait out the full timeout for as
+  // long as the dialog stays open, since the backdrop never disappears
+  // until the dialog itself closes.
+  if (getOpenDialog()) return null;
+
+  for (const sel of OVERLAY_INDICATOR_SELECTORS) {
+    let els;
+    try {
+      els = document.querySelectorAll(sel);
+    } catch (_) {
+      continue;
+    }
+    for (const el of els) {
+      if (isExtensionUiTarget(el)) continue;
+      if (!isElementVisible(el)) continue;
+      if (containsInteractiveFormContent(el)) continue;
+      return el;
     }
   }
 
@@ -2230,7 +2290,7 @@ async function waitForNoLoadingIndicator({
     if (!indicator) return { ok: true };
     await nextFrame();
   }
-  return { ok: false, error: "A loading indicator is still visible after timeout." };
+  return { ok: false, error: "A loading indicator is still visible after timeout.", code: "LOADER_STILL_VISIBLE" };
 }
 
 // Runs the DOM/network/loader checks as ONE continuous poll loop instead of
@@ -2246,12 +2306,12 @@ async function waitForPageIdle({
   timeoutMs = DEFAULT_WAIT.pageIdleTimeoutMs,
   loaderTimeoutMs = DEFAULT_WAIT.loadingIndicatorTimeoutMs
 } = {}) {
-  // Phase 1: a visible loading overlay gets its own dedicated, longer wait,
+  // Phase 1: a visible loading overlay gets its own dedicated, 10-minute wait,
   // separate from (and before) the fast ambient DOM/network quiet check
   // below. It's a much stronger "not ready" signal than background chatter,
-  // so it deserves more patience — but still best-effort: if the page's own
-  // error handling gets stuck and the loader never clears, we proceed anyway
-  // rather than aborting the whole replay over a bug outside our control.
+  // so unlike phase 2 below, exhausting this window is treated as a real
+  // failure by performStep() (which aborts the whole replay) rather than
+  // proceeding against a page that's still loading.
   const loaderResult = await waitForNoLoadingIndicator({ timeoutMs: loaderTimeoutMs });
   if (!loaderResult.ok) return loaderResult;
 
@@ -2295,7 +2355,11 @@ async function waitForPageIdle({
       if (now - lastUnsettled >= quietMs) return { ok: true };
       await nextFrame();
     }
-    return { ok: false, error: "Page did not settle (DOM/network/loading indicator) within timeout." };
+    // Note: unlike the phase-1 loader timeout above, this stays best-effort —
+    // some pages legitimately never go fully network/DOM quiet (analytics
+    // beacons, countdown timers), so proceeding anyway avoids the whole
+    // replay aborting over background chatter that isn't actually blocking.
+    return { ok: false, error: "Page did not settle (DOM/network/loading indicator) within timeout.", code: "PAGE_NOT_SETTLED" };
   } finally {
     observer.disconnect();
   }
@@ -2469,18 +2533,22 @@ function getOpenDialog() {
   if (nativeDialog) return nativeDialog;
 
   // ARIA dialog roles that are visible
-  const ariaDialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
+  const ariaDialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
   for (const d of ariaDialogs) {
     if (isElementVisible(d)) return d;
   }
 
-  // Common class-based modals (Bootstrap, Tailwind, Material, etc.)
+  // Common class-based modals (Bootstrap, Tailwind, Material, jQuery UI, etc.)
+  // jQuery UI's .dialog() widget (which AEM Forms guide "popup" panels are
+  // commonly rendered through) wraps content in .ui-dialog; it also sets
+  // role="dialog" in modern versions, but older markup may omit it.
   const classPatterns = [
     '.modal.show',          // Bootstrap
     '.modal[style*="display: block"]',
     '[data-modal][aria-hidden="false"]',
     '.MuiDialog-root',       // Material UI
     '.ant-modal-root',       // Ant Design
+    '.ui-dialog',            // jQuery UI (used by AEM Forms guide popup panels)
     '[class*="modal"][class*="open"]',
     '[class*="modal"][class*="visible"]',
     '[class*="dialog"][class*="open"]',
@@ -2582,11 +2650,26 @@ async function performStep(step) {
   // no pending mutations, no in-flight requests, no visible loader — before
   // we touch it. This catches both the previous step kicking off an async
   // validation call, and a delayed fetch (e.g. a prefill lookup) that starts
-  // a moment after the page first looked quiet. Best-effort: some pages never
-  // go fully quiet (animated loaders, analytics beacons), so wait up to the
-  // timeout and proceed anyway rather than aborting the whole replay.
+  // a moment after the page first looked quiet.
   const pageIdle = await waitForPageIdle();
   if (!pageIdle.ok) {
+    if (pageIdle.code === "LOADER_STILL_VISIBLE") {
+      // A loading indicator (e.g. a popup that never finished loading) was
+      // still visible after the full 10-minute wait — proceeding anyway
+      // would mean interacting with a page we know isn't ready, so fail the
+      // step outright. In non-soft mode this aborts the whole replay rather
+      // than silently producing wrong/missed field values.
+      console.error("[autotest][replay] Loading indicator never cleared, aborting step:", pageIdle.error);
+      return {
+        ok: false,
+        error: pageIdle.error,
+        code: "LOADING_INDICATOR_TIMEOUT",
+        debug: consumeDebugBuffer()
+      };
+    }
+    // DOM/network settle timeout stays best-effort: some pages legitimately
+    // never go fully quiet (analytics beacons, countdown timers), so wait up
+    // to the timeout and proceed anyway rather than aborting the whole replay.
     console.warn("[autotest][replay] Page never fully settled before step, continuing:", pageIdle.error);
   }
 
