@@ -933,6 +933,15 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
     const envs = (await store.get(ENV_KEY)) || [];
 
     for (let i = 0; i < steps.length; i += 1) {
+      // Unconditional trace — logs EVERY step the loop visits, before any
+      // skip/control-flow branch below has a chance to `continue` past it.
+      // If a step's id never shows up here, it never reached the loop body
+      // at all (e.g. missing from the `steps` array passed into this
+      // function); if it shows up here but not in the "Sending message to
+      // content script" trace further down, something between here and
+      // there is skipping it.
+      console.log(`[autotest][replay][step-trace] i=${i}/${steps.length} id=${steps[i]?.id} type=${steps[i]?.type} value=${JSON.stringify(steps[i]?.value)} selector=${steps[i]?.selector?.primary?.value || null}`);
+
       // Check if replay has been stopped
       if (!replayLocks.get(tabId)) {
         console.log("[autotest][replay] Replay stopped by user at step", i);
@@ -1045,7 +1054,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         continue;
       }
       
-      console.log("[autotest][replay] step start", { idx: i, type: step?.type, envId: stepEnv?.id || null });
+      console.log("[autotest][replay] step start", { idx: i, id: step?.id, type: step?.type, value: step?.value, envId: stepEnv?.id || null });
 
       // ── Cross-tab tab-index switch ───────────────────────────────────────
       // Switch tabs when the step's tabIndex differs from the currently active
@@ -1296,7 +1305,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         throw new Error("Content script is not responding. The page may have been suspended or navigated.");
       }
 
-      console.log(`[autotest][replay] Step ${i}: Sending message to content script...`);
+      console.log(`[autotest][replay][step-trace] Step ${i}: Sending message to content script...`, { id: step?.id, type: step?.type, value: step?.value });
 
       let resp;
       // Must exceed content.js's own internal waits (up to 10 minutes for a
@@ -1318,14 +1327,17 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         ]);
         const sendDuration = Date.now() - sendStartTime;
         
-        console.log(`[autotest][replay] Step ${i}: Received response from content script:`, {
+        console.log(`[autotest][replay][step-trace] Step ${i}: Received response from content script:`, {
+          id: step?.id,
           ok: resp?.ok,
-          code: resp?.code
+          code: resp?.code,
+          sendDuration
         });
       } catch (sendErr) {
         // If sendMessage fails, the page might have navigated.
         // Chrome uses several different strings for this class of error.
         const errMsg = sendErr?.message || String(sendErr);
+        console.error(`[autotest][replay][step-trace] Step ${i}: sendMessage THREW`, { id: step?.id, type: step?.type, value: step?.value, error: errMsg });
         const isChannelError = (
           errMsg.includes("Receiving end does not exist") ||
           errMsg.includes("message channel closed") ||
@@ -1334,6 +1346,8 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           errMsg.includes("timed out") ||
           errMsg.includes("asynchronous response")   // "A listener indicated an asynchronous response..."
         );
+
+        let retriedAfterNav = false;
 
         if (isChannelError) {
           console.log("[autotest][replay] Step triggered navigation (channel closed), waiting for page load...");
@@ -1357,27 +1371,62 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
               new Promise((_, rej) => setTimeout(() => rej(new Error("ready check timeout")), 10000))
             ]);
             if (readyResp?.ok) {
-              // Navigation completed successfully — treat the triggering step as passed
-              stepReport.status = "passed";
-              stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
-              lastReportByTab.set(tabId, report);
-              continue;
+              // A click/submit plausibly caused a real navigation, in which
+              // case the triggering step already did its job — assume passed.
+              // But "input"/"change" steps typing a value can NOT legitimately
+              // cause a channel-closing navigation on their own; a channel
+              // closure here almost always means an unrelated async re-render
+              // (e.g. a prefill/journey API call reshaping the DOM) raced with
+              // the input and killed the port before the value was confirmed
+              // set. Blindly marking it "passed" reports false success while
+              // the field is actually left empty — re-send it against the
+              // now-recovered page instead of assuming it worked.
+              if (step?.type === "input" || step?.type === "change") {
+                console.log(`[autotest][replay][step-trace] Step ${i}: re-sending input/change after channel closure (value likely never applied)`);
+                try {
+                  resp = await Promise.race([
+                    chrome.tabs.sendMessage(activeTabId, {
+                      type: "replay_execute_step",
+                      step,
+                      env: stepEnv,
+                      healingConfig: selectorHealing
+                    }),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error("Retry after channel closure timed out")), stepTimeoutMs))
+                  ]);
+                  console.log(`[autotest][replay][step-trace] Step ${i}: retry response`, { id: step?.id, ok: resp?.ok, code: resp?.code });
+                } catch (retryErr) {
+                  console.error(`[autotest][replay][step-trace] Step ${i}: retry after channel closure also failed`, retryErr?.message);
+                  resp = { ok: false, error: `Retry after channel closure failed: ${retryErr?.message}`, code: "RETRY_AFTER_NAV_FAILED" };
+                }
+                // Let the normal resp?.ok handling below (after this whole
+                // try/catch) report the retry's real outcome, instead of the
+                // unconditional failure branch further down.
+                retriedAfterNav = true;
+              } else {
+                stepReport.status = "passed";
+                stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
+                lastReportByTab.set(tabId, report);
+                continue;
+              }
             }
           } catch (readyErr) {
             console.error("[autotest][replay] Failed to verify page ready after navigation:", readyErr?.message);
           }
         }
-        // Not a navigation error, or verification failed — surface as step failure
-        if (softAssertions) {
-          // In soft mode, log and continue instead of aborting
-          console.warn(`[autotest][replay] Step ${i} failed (soft mode, continuing):`, errMsg);
-          stepReport.status = "soft_fail";
-          stepReport.error = { message: errMsg, code: "EXEC_ERROR", soft: true };
-          stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
-          lastReportByTab.set(tabId, report);
-          continue;
+
+        if (!retriedAfterNav) {
+          // Not a navigation error, or verification failed — surface as step failure
+          if (softAssertions) {
+            // In soft mode, log and continue instead of aborting
+            console.warn(`[autotest][replay] Step ${i} failed (soft mode, continuing):`, errMsg);
+            stepReport.status = "soft_fail";
+            stepReport.error = { message: errMsg, code: "EXEC_ERROR", soft: true };
+            stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
+            lastReportByTab.set(tabId, report);
+            continue;
+          }
+          throw new Error("Failed to execute step: " + errMsg);
         }
-        throw new Error("Failed to execute step: " + errMsg);
       }
       
       console.log("[autotest][replay] step response", { idx: i, ok: !!resp?.ok, code: resp?.code || null });

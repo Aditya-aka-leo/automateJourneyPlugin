@@ -401,9 +401,30 @@ function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(resolve));
 }
 
+function describeElementForLog(el) {
+  if (!el) return "null";
+  const id = el.id ? `#${el.id}` : "";
+  const cls = el.className && typeof el.className === "string"
+    ? `.${el.className.trim().split(/\s+/).slice(0, 3).join(".")}`
+    : "";
+  return `<${el.tagName?.toLowerCase()}${id}${cls}>`;
+}
+
 function isExtensionUiTarget(target) {
   if (!target || !target.closest) return false;
   return Boolean(target.closest('[data-autotest-extension="true"]'));
+}
+
+// AEM's WCM authoring/edit mode renders empty "Drag components here" drop
+// zones with these markers. They only exist in the author/edit-mode view of
+// a page — on the real published page a replay actually runs against, they
+// either don't render at all or stay hidden, so a step recorded against one
+// can never be found later, and polls forever. A click landing on one during
+// recording is always an accident (the author overlay sitting over/near the
+// real intended target), never a genuine interaction to replay.
+function isAemAuthoringPlaceholder(target) {
+  if (!target || !target.closest) return false;
+  return Boolean(target.closest('.cq-placeholder, .afEditorPlaceholder, [data-emptytext]'));
 }
 
 function dedupeKey({ type, selector, value, relativePath, queryParams }) {
@@ -585,6 +606,22 @@ function isUniqueMatchFor(el, cssValue) {
   return matches.length === 1 && matches[0] === el;
 }
 
+// UI frameworks (Angular Material/CDK, MUI, Radix, Chakra, React 18 useId(),
+// Ember, react-select, etc.) assign ids from an incrementing counter tied to
+// component MOUNT ORDER, not to the element's identity — e.g.
+// "mat-mdc-checkbox-0-input". That index can land on a completely different
+// element next run if anything upstream renders in a different order (async
+// data, conditional branches, lazy-loaded modules). It's still unique *right
+// now*, so treating it as a top-priority "stable id" selector works during
+// recording and then silently points at the wrong element (or nothing) later.
+function isLikelyUnstableFrameworkId(id) {
+  // Matches both older Angular Material ids (mat-input-0, mat-checkbox-3)
+  // and newer MDC-based ones (mat-mdc-checkbox-0-input) — "mat-" alone
+  // covers both, since the latter is just "mat-" + "mdc-...".
+  return /^(mat-|cdk-|mdc-|mui-|radix-|chakra-|headlessui-|ember\d*-|react-select-)[\w-]*\d+/i.test(id)
+    || /^:r[0-9a-z]+:$/i.test(id); // React 18 useId()
+}
+
 function generateSelector(el) {
   if (!el || el.nodeType !== Node.ELEMENT_NODE) {
     return { primary: null, fallbacks: [] };
@@ -592,9 +629,12 @@ function generateSelector(el) {
 
   const candidates = [];
   const tag = el.tagName.toLowerCase();
+  const idIsUnstable = el.id && isLikelyUnstableFrameworkId(el.id);
 
-  // 1) Stable id
-  if (el.id) {
+  // 1) Stable id — skip framework auto-generated ids here; they're pushed
+  // further down (after aria-label/name/text) as a lower-priority fallback
+  // instead, since they still often work but shouldn't be trusted first.
+  if (el.id && !idIsUnstable) {
     candidates.push({
       type: "css",
       value: `#${cssEscape(el.id)}`,
@@ -750,6 +790,18 @@ function generateSelector(el) {
       type: "text",
       value: stableLabel,
       reason: "Stable text label (dynamic values stripped) for resilient matching."
+    });
+  }
+
+  // 4b) Framework auto-generated id — kept as a low-confidence fallback
+  // below aria-label/name/text. It resolves uniquely more often than not
+  // (the mount-order index is frequently stable in practice), so it's still
+  // worth trying, just not trusted as the primary selector.
+  if (idIsUnstable) {
+    candidates.push({
+      type: "css",
+      value: `#${cssEscape(el.id)}`,
+      reason: "Framework auto-generated id (e.g. Angular Material/CDK) — kept as a low-priority fallback since its index can shift between sessions."
     });
   }
 
@@ -3403,23 +3455,64 @@ async function performStep(step) {
     
     // Focus and clear existing value with realistic events
     el.focus();
-    
+
+    const targetValue = step?.value ?? "";
+    const elDesc = describeElementForLog(el);
+    console.log("[autotest][replay][input-check] target element:", elDesc, {
+      id: el.id || null,
+      name: el.getAttribute?.('name') || null,
+      valueBefore: el.value,
+      targetValue,
+      matchedSameElementAsQuerySelector: el.id ? document.getElementById(el.id) === el : "no-id"
+    });
+
     // Use native input setter to bypass React's synthetic event system
     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, 'value'
     )?.set || Object.getOwnPropertyDescriptor(
       window.HTMLTextAreaElement.prototype, 'value'
     )?.set;
-    
+
     if (nativeInputValueSetter) {
-      nativeInputValueSetter.call(el, step?.value ?? "");
+      nativeInputValueSetter.call(el, targetValue);
     } else {
-      el.value = step?.value ?? "";
+      el.value = targetValue;
     }
-    
+    console.log(`[autotest][replay][input-check] after native setter: el.value="${el.value}"`);
+
     el.dispatchEvent(new Event("input", { bubbles: true }));
+    console.log(`[autotest][replay][input-check] after "input" event: el.value="${el.value}"`);
+
     el.dispatchEvent(new Event("change", { bubbles: true }));
+    console.log(`[autotest][replay][input-check] after "change" event: el.value="${el.value}"`);
+
     el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+    console.log(`[autotest][replay][input-check] after "blur" event: el.value="${el.value}"`);
+
+    if (el.value !== targetValue) {
+      console.warn(`[autotest][replay][input-check] MISMATCH immediately after dispatch — expected "${targetValue}", got "${el.value}" on`, elDesc);
+    }
+
+    // Fire-and-forget delayed re-check: some frameworks (React controlled
+    // inputs, AEM guide field validation) reset the value a tick or more
+    // after blur — e.g. an onBlur validator that rejects the value and
+    // clears it, or a duplicate/stale element getting the value while a
+    // different visible element is what's actually on screen. This doesn't
+    // block the step's return (kept fast, per the no-post-action-wait
+    // policy below) — it's purely diagnostic, logged after the fact.
+    const capturedEl = el;
+    setTimeout(() => {
+      const laterValue = capturedEl.value;
+      const stillInDom = document.contains(capturedEl);
+      if (laterValue !== targetValue) {
+        console.warn(
+          `[autotest][replay][input-check] VALUE CHANGED AFTER STEP — 300ms later, expected "${targetValue}", found "${laterValue}" (element still in DOM: ${stillInDom}) on`,
+          elDesc
+        );
+      } else {
+        console.log(`[autotest][replay][input-check] value still correct 300ms later: "${laterValue}"`);
+      }
+    }, 300);
 
     // No post-action wait — the next step's pre-step gate covers this
     // (typing/blurring a field commonly triggers a debounced validation call,
@@ -4052,6 +4145,35 @@ function resolveClickTarget(target) {
   return target;
 }
 
+// resolveClickTarget() walks up looking for an interactive ancestor, but
+// falls back to returning the original element unchanged if it never finds
+// one within 6 levels — e.g. a plain wrapper div with no text, no label, no
+// click handler, no role. A click landing there is almost always incidental
+// (padding, whitespace, a decorative icon, an AEM authoring artifact like
+// cq-placeholder) rather than a genuine interaction. Recording it produces a
+// step that's either meaningless or impossible to find again on replay.
+// Reference: a sibling recorder (hdfc-form-Filler) avoids this entirely by
+// only recording clicks on button/input[type=submit|button] — too narrow for
+// us (we also need radio/checkbox/custom ARIA toggles/div-styled buttons),
+// but its "reject empty text + no name" guard is the right general filter.
+function isMeaninglessClickTarget(el) {
+  if (!el) return true;
+  const tag = el.tagName?.toLowerCase();
+  const interactiveTags = new Set(['input', 'button', 'select', 'textarea', 'a']);
+  if (interactiveTags.has(tag)) return false;
+  if (el.getAttribute?.('role')) return false; // explicit ARIA role — treat as intentional
+  if (el.onclick || el.getAttribute?.('tabindex') != null) return false;
+  if ((el.textContent || '').trim()) return false;
+  if (el.getAttribute?.('aria-label') || el.getAttribute?.('title') || el.getAttribute?.('name')) return false;
+  // A wrapper with no text/label of its own but that directly contains a
+  // real form control is still a meaningful target — clicking it is how
+  // users commonly focus/activate the control inside (e.g. a styled
+  // "textField" div wrapping a plain <input>).
+  if (el.querySelector?.('input, textarea, select, button, a')) return false;
+  // Nothing suggests this is a genuine, findable interactive element.
+  return true;
+}
+
 // ═══════════════════════════════════════════════════════════════
 // ─── Assert Mode (capture assertions during recording) ───────
 // ═══════════════════════════════════════════════════════════════
@@ -4370,6 +4492,10 @@ function handleClick(event) {
   if (!state.isRecording) return;
   if (event.button !== 0) return;
   if (isExtensionUiTarget(event.target)) return;
+  if (isAemAuthoringPlaceholder(event.target)) {
+    console.log("[autotest][record] Ignoring click on AEM authoring placeholder (cq-placeholder) — not a real page element, would never be findable on replay.");
+    return;
+  }
 
   // ── Assert mode: intercept click to capture assertion instead ──
   if (state.isAssertMode) {
@@ -4440,7 +4566,17 @@ function handleClick(event) {
     return;
   }
   
-  // For non-input elements, send click immediately
+  // For non-input elements, send click immediately — unless nothing about
+  // the resolved target suggests it's a genuine, findable interactive
+  // element (no text, no label, no role, no handler), in which case this is
+  // almost certainly an incidental click, not something worth replaying.
+  if (isMeaninglessClickTarget(target)) {
+    console.log("[autotest][record] Ignoring click — no text/label/role/handler on resolved target, likely incidental:", {
+      tag: target.tagName?.toLowerCase(),
+      class: typeof target.className === "string" ? target.className.slice(0, 60) : null
+    });
+    return;
+  }
   flushPendingInput();
   sendStep(makeStep("click", target));
   state.lastClickSentAt = Date.now();
