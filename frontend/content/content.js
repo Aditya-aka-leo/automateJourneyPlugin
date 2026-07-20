@@ -398,7 +398,25 @@ function patchNetworkTracking() {
 }
 
 function nextFrame() {
-  return new Promise((resolve) => requestAnimationFrame(resolve));
+  // requestAnimationFrame alone can be throttled to a crawl — or suspended
+  // entirely — for a tab that isn't currently focused/visible. That's
+  // exactly where a cross-tab journey (e.g. an eKYC redirect opening in a
+  // new tab) can leave replay running, silently stalling every poll loop
+  // that uses this (waitForElementVisible, waitForPageIdle, etc.) with no
+  // logic bug at all — the browser just never calls the callback again.
+  // Race it against a plain timer so progress continues either way; rAF
+  // still wins (and keeps ticks aligned to paint) whenever the tab is
+  // actually visible.
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    requestAnimationFrame(finish);
+    setTimeout(finish, 50);
+  });
 }
 
 function describeElementForLog(el) {
@@ -801,7 +819,8 @@ function generateSelector(el) {
     candidates.push({
       type: "css",
       value: `#${cssEscape(el.id)}`,
-      reason: "Framework auto-generated id (e.g. Angular Material/CDK) — kept as a low-priority fallback since its index can shift between sessions."
+      reason: "Framework auto-generated id (e.g. Angular Material/CDK) — kept as a low-priority fallback since its index can shift between sessions.",
+      lowPriority: true
     });
   }
 
@@ -823,14 +842,26 @@ function generateSelector(el) {
   // it was pushed earlier, and querySelector will always resolve it to
   // whichever sibling comes first in DOM order, silently misdirecting every
   // step meant for the other siblings (e.g. month/year steps landing on day).
+  //
+  // Candidates flagged `lowPriority` (e.g. framework auto-generated ids like
+  // Angular Material's "mat-option-12") are deliberately excluded from the
+  // "unique right now" fast track even when they do resolve uniquely at
+  // record time — that's exactly the trap: they're unique *this instant*
+  // but the underlying index is tied to component mount order, so it can
+  // resolve to nothing (or a different sibling) as soon as anything upstream
+  // re-renders. A stable text/aria-label match is worth trying first even
+  // though it's not a "css" selector, so it's ranked ahead of lowPriority
+  // css candidates instead of always sinking below every css candidate.
   const uniqueCss = [];
+  const lowPriorityCss = [];
   const nonUniqueCss = [];
   const nonCss = [];
   for (const c of candidates) {
     if (c.type !== "css") { nonCss.push(c); continue; }
+    if (c.lowPriority) { lowPriorityCss.push(c); continue; }
     (isUniqueMatchFor(el, c.value) ? uniqueCss : nonUniqueCss).push(c);
   }
-  const orderedCandidates = [...uniqueCss, ...nonUniqueCss, ...nonCss];
+  const orderedCandidates = [...uniqueCss, ...nonCss, ...lowPriorityCss, ...nonUniqueCss];
 
   const [primary, ...fallbacks] = orderedCandidates;
 
@@ -1726,6 +1757,14 @@ async function findElementWithRefinement(step, selector, maxRetries = 3, customT
   return initialResult;
 }
 
+// Deliberately does NOT check opacity. Many UI libraries (Angular Material's
+// MDC checkboxes/radios/switches, MUI, and plenty of custom widgets) render
+// the real native <input> transparent (opacity: 0) and layered on top of a
+// decorative sibling that shows the visible checkmark/box — the input is
+// still exactly where the user clicks and still toggles on click, it's just
+// visually see-through. Treating opacity 0 as "not visible" made replay wait
+// out the full 10-minute elementVisibleMs timeout on every such control
+// (see waitForElementVisible) since it never becomes non-transparent.
 function isElementVisible(el) {
   if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
   const style = window.getComputedStyle(el);
@@ -3929,25 +3968,18 @@ async function performStep(step) {
   return { ok: false, error: `Unsupported step type: ${type}`, code: "UNSUPPORTED_STEP" };
 }
 
-// Helper function to check element visibility
-function isElementVisible(elem) {
-  if (!elem) return false;
-  const style = window.getComputedStyle(elem);
-  const rect = elem.getBoundingClientRect();
-  return (
-    style.display !== 'none' &&
-    style.visibility !== 'hidden' &&
-    style.opacity !== '0' &&
-    rect.width > 0 &&
-    rect.height > 0
-  );
-}
-
 async function sendStep(step) {
   if (!state.isRecording) return;
   if (isDuplicate(step)) return;
+  if (!step.id) step.id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  // Remember the step behind a click/input/change/submit so a suppressed SPA
+  // navigation right after it (see handleNavigation) can patch this step's
+  // relativePath to the page it actually landed on.
+  if (step.type === "click" || step.type === "input" || step.type === "change" || step.type === "submit") {
+    state.lastInteractionStep = step;
+  }
   await chrome.runtime.sendMessage({ type: "record_step", step });
-  
+
   // Learn from recording — every recorded action is a confirmed-good interaction
   learnFromRecordedStep(step);
 }
@@ -4714,8 +4746,21 @@ function handleNavigation(kind) {
     if (timeSinceClick < CLICK_NAV_SUPPRESS_MS) {
       console.log("[autotest][record] Suppressing", kind, "navigation —",
         timeSinceClick + "ms after click (SPA transition)");
-      // Update the last click step's relativePath to the NEW path so replay
-      // knows the expected page after the click.
+      // Update the last recorded step's relativePath to the NEW path so the
+      // step list/HUD reflects the page this step actually landed on,
+      // instead of the page it was clicked from.
+      const interactionStep = state.lastInteractionStep;
+      if (interactionStep) {
+        const { relativePath, queryParams } = computeRelativeLocation(window.location.href, state.baseUrl);
+        interactionStep.relativePath = relativePath;
+        interactionStep.queryParams = queryParams;
+        chrome.runtime.sendMessage({
+          type: "patch_step_path",
+          stepId: interactionStep.id,
+          relativePath,
+          queryParams
+        }).catch(() => {});
+      }
       return;
     }
   }

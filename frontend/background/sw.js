@@ -1915,6 +1915,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return { ok: true };
     }
 
+    if (type === "patch_step_path") {
+      // Fired when content.js suppresses a click-triggered SPA navigation
+      // (pushState/replaceState) — the step itself already recorded, but its
+      // relativePath/queryParams still reflect the pre-navigation page. This
+      // patches the in-progress step to the page it actually landed on.
+      if (tabId == null) return { ok: false, error: "NO_TAB" };
+      const list = getStepsForTab(tabId);
+      const step = list.find((s) => s.id === message?.stepId);
+      if (step) {
+        if (typeof message.relativePath === "string") step.relativePath = message.relativePath;
+        if (message.queryParams) step.queryParams = message.queryParams;
+        try {
+          await chrome.tabs.sendMessage(tabId, { type: "hud_recording_update", steps: [...list] });
+        } catch (_) { /* HUD may not be active */ }
+      }
+      return { ok: true };
+    }
+
     if (type === "network_capture") {
       if (tabId == null) return { ok: false };
       const captures = capturedNetworkByTab.get(tabId);
