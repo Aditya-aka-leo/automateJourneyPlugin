@@ -41,6 +41,7 @@
     {
       "matches": ["http://*/*", "https://*/*"],
       "js": ["content/hud.js", "content/content.js"],
+      "css": ["content/hud.css"],
       "run_at": "document_idle"
     }
   ],

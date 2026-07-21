@@ -8,174 +8,14 @@ window.__autotestHudLoaded = true;
 
 const HUD_ID = "__autotest_hud__";
 
-/* ═══════════════════════════════════════════════════════════
-   Container styles (minimal — the popup CSS handles the rest)
-   ═══════════════════════════════════════════════════════════ */
-const HUD_STYLES = `
-  #${HUD_ID} {
-    --h-bg:      rgba(15, 17, 23, 0.97);
-    --h-panel:   rgba(22, 26, 38, 0.98);
-    --h-text:    #e7e9ee;
-    --h-muted:   #8891a5;
-    --h-border:  rgba(255, 255, 255, 0.09);
-    --h-brand:   #7c5cff;
-    --h-brand-s: rgba(124, 92, 255, 0.16);
-    --h-red:     #ff4d4d;
-    --h-font:    ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-
-    position: fixed;
-    top: 14px;
-    right: 14px;
-    z-index: 2147483647;
-    width: 370px;
-    height: 600px;
-    max-height: 88vh;
-    display: flex;
-    flex-direction: column;
-    background: var(--h-panel);
-    backdrop-filter: blur(16px) saturate(1.4);
-    -webkit-backdrop-filter: blur(16px) saturate(1.4);
-    border: 1px solid var(--h-border);
-    border-radius: 14px;
-    box-shadow: 0 8px 40px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.04) inset;
-    overflow: hidden;
-    pointer-events: auto;
-    font-family: var(--h-font);
-    font-size: 12px;
-    color: var(--h-text);
-    line-height: 1.4;
-    transition: width 0.25s ease, max-height 0.25s ease, border-radius 0.25s ease, height 0.25s ease;
-    resize: vertical;
-  }
-
-  /* ─── Minimized pill ────────────────────────────────────── */
-  #${HUD_ID}.${HUD_ID}--mini {
-    width: auto;
-    max-width: 300px;
-    min-width: 180px;
-    height: auto !important;
-    max-height: 42px;
-    border-radius: 22px;
-    resize: none;
-  }
-  #${HUD_ID}.${HUD_ID}--mini #${HUD_ID}__body { display: none !important; }
-  #${HUD_ID}.${HUD_ID}--mini #${HUD_ID}__title { display: none; }
-  #${HUD_ID}.${HUD_ID}--mini #${HUD_ID}__mini-status { display: flex; }
-  #${HUD_ID}.${HUD_ID}--mini #${HUD_ID}__header { border-bottom: none; padding: 6px 10px; }
-
-  /* ─── Dragging state ────────────────────────────────────── */
-  #${HUD_ID}.${HUD_ID}--dragging {
-    opacity: 0.85;
-    transition: none;
-    cursor: grabbing !important;
-  }
-
-  @media (prefers-color-scheme: light) {
-    #${HUD_ID} {
-      --h-bg:     #f2f4f8;
-      --h-panel:  rgba(255, 255, 255, 0.97);
-      --h-text:   #111318;
-      --h-muted:  #5a6374;
-      --h-border: rgba(17, 19, 24, 0.11);
-      --h-brand-s: rgba(124, 92, 255, 0.10);
-      box-shadow: 0 8px 40px rgba(0,0,0,0.12), 0 0 0 1px rgba(0,0,0,0.05) inset;
-    }
-  }
-
-  /* ─── Header / drag bar ─────────────────────────────────── */
-  #${HUD_ID}__header {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 7px 10px;
-    border-bottom: 1px solid var(--h-border);
-    flex-shrink: 0;
-    cursor: grab;
-    user-select: none;
-    -webkit-user-select: none;
-  }
-  #${HUD_ID}__header:active { cursor: grabbing; }
-  #${HUD_ID}__header-logo { color: var(--h-brand); flex-shrink: 0; display: flex; }
-  #${HUD_ID}__title {
-    flex: 1;
-    font-weight: 800;
-    font-size: 12px;
-    letter-spacing: -0.2px;
-  }
-
-  /* ─── Mini status (visible only when minimized) ─────────── */
-  #${HUD_ID}__mini-status {
-    display: none;
-    align-items: center;
-    gap: 6px;
-    flex: 1;
-    overflow: hidden;
-  }
-  #${HUD_ID}__mini-dot {
-    width: 7px; height: 7px;
-    border-radius: 50%;
-    flex-shrink: 0;
-    background: var(--h-muted);
-  }
-  #${HUD_ID}__mini-dot--idle    { background: var(--h-muted); opacity: 0.6; }
-  #${HUD_ID}__mini-dot--running { background: #3498db; animation: ${HUD_ID}_pulse 1.4s ease-in-out infinite; }
-  #${HUD_ID}__mini-dot--paused  { background: #f39c12; }
-  #${HUD_ID}__mini-dot--success { background: #2ecc71; }
-  #${HUD_ID}__mini-dot--failure { background: var(--h-red); }
-  #${HUD_ID}__mini-dot--recording { background: var(--h-red); animation: ${HUD_ID}_recPulse 1s ease-in-out infinite; }
-  @keyframes ${HUD_ID}_pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.35;transform:scale(.8)} }
-  @keyframes ${HUD_ID}_recPulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:.4;transform:scale(.8)} }
-
-  #${HUD_ID}__mini-label {
-    font-weight: 700;
-    font-size: 11px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 1;
-  }
-  #${HUD_ID}__mini-counter {
-    font-size: 10px;
-    font-weight: 800;
-    opacity: 0.6;
-    flex-shrink: 0;
-    white-space: nowrap;
-  }
-
-  /* ─── Header buttons ────────────────────────────────────── */
-  .${HUD_ID}__hdr-btn {
-    width: 22px; height: 22px;
-    display: flex; align-items: center; justify-content: center;
-    background: none; border: 1px solid var(--h-border);
-    border-radius: 6px; color: var(--h-muted);
-    cursor: pointer; padding: 0; transition: all 0.15s;
-    flex-shrink: 0;
-  }
-  .${HUD_ID}__hdr-btn:hover {
-    background: var(--h-brand-s);
-    color: var(--h-brand);
-    border-color: rgba(124, 92, 255, 0.25);
-  }
-  #${HUD_ID}__close:hover {
-    background: rgba(255, 77, 77, 0.1);
-    color: var(--h-red);
-    border-color: rgba(255, 77, 77, 0.3);
-  }
-
-  /* ─── iframe body ───────────────────────────────────────── */
-  #${HUD_ID}__body {
-    flex: 1;
-    overflow: hidden;
-    min-height: 0;
-  }
-  #${HUD_ID}__body iframe {
-    width: 100%;
-    height: 100%;
-    border: none;
-    background: transparent;
-    display: block;
-  }
-`;
+// Styles live in hud.css (declared in manifest.json's content_scripts.css)
+// instead of being injected here via a JS-created <style> element — some
+// sites enforce a nonce-only style-src CSP with no 'unsafe-inline' fallback,
+// which silently blocks a script-injected <style> tag (no catchable
+// exception, the HUD just renders unstyled). CSS declared in the manifest is
+// injected by the browser's extension system itself and is exempt from the
+// page's CSP, the same way content_scripts JS files are exempt from
+// script-src.
 
 /* ═══════════════════════════════════════════════════════════ */
 const HUD_SVG = {
@@ -210,7 +50,6 @@ const _tabIdReady = _resolveTabId();
 class AutotestHUD {
   constructor() {
     this.hud = null;
-    this.styleEl = null;
     this.iframe = null;
     this.isVisible = false;
     this.isMinimized = false;
@@ -220,11 +59,6 @@ class AutotestHUD {
 
   init() {
     if (this.hud) return;
-
-    // Inject styles
-    this.styleEl = document.createElement("style");
-    this.styleEl.textContent = HUD_STYLES;
-    document.head.appendChild(this.styleEl);
 
     // Build container
     this.hud = document.createElement("div");
@@ -401,7 +235,6 @@ class AutotestHUD {
 
   destroy() {
     if (this.hud) { this.hud.remove(); this.hud = null; }
-    if (this.styleEl) { this.styleEl.remove(); this.styleEl = null; }
     if (this._storageListener) {
       chrome.storage.onChanged.removeListener(this._storageListener);
       this._storageListener = null;

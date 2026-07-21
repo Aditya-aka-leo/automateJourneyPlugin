@@ -952,10 +952,12 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       }
       
       // Check if replay is paused
+      let wasPaused = false;
       if (pausedReplays.get(tabId)) {
         console.log("[autotest][replay] Entering pause wait loop at step", i, "tabId:", tabId);
       }
       while (pausedReplays.get(tabId)) {
+        wasPaused = true;
         // Also check if stopped while paused
         if (!replayLocks.get(tabId)) {
           console.log("[autotest][replay] Replay stopped while paused at step", i);
@@ -967,7 +969,11 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         console.log("[autotest][replay] Paused at step", i, "- waiting for resume...");
         await new Promise(resolve => setTimeout(resolve, 500)); // Check every 500ms
       }
-      if (i > 0 && pausedReplays.has(tabId) === false) {
+      // Only log "Resumed" if this step actually went through the pause-wait
+      // loop above — pausedReplays.has(tabId) is false by default for nearly
+      // every step (whether or not pause was ever used), so checking that
+      // instead logged "Resumed!" on every single step, paused or not.
+      if (wasPaused) {
         console.log("[autotest][replay] Resumed! Continuing from step", i);
       }
       
@@ -1364,12 +1370,17 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
             console.warn("[autotest][replay] Could not re-inject content scripts:", injectErr?.message);
           }
 
-          // Now verify the new page is ready
+          // Now verify the new page is ready. No artificial timeout here —
+          // replay_wait_ready itself already waits as long as genuinely
+          // needed (see waitForPageIdle); racing it against a short fixed
+          // timeout just aborts the whole replay on any page that happens to
+          // take longer than that to settle after the navigation.
           try {
-            const readyResp = await Promise.race([
-              chrome.tabs.sendMessage(activeTabId, { type: "replay_wait_ready" }),
-              new Promise((_, rej) => setTimeout(() => rej(new Error("ready check timeout")), 10000))
-            ]);
+            const scriptAlive = await waitForContentScriptAlive(activeTabId);
+            if (!scriptAlive) {
+              throw new Error("Content script did not respond after navigation.");
+            }
+            const readyResp = await chrome.tabs.sendMessage(activeTabId, { type: "replay_wait_ready" });
             if (readyResp?.ok) {
               // A click/submit plausibly caused a real navigation, in which
               // case the triggering step already did its job — assume passed.

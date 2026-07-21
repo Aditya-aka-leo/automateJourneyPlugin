@@ -460,15 +460,7 @@ function isDuplicate(step) {
   // when AEM re-fires change on an already-filled field during a re-render.
   if ((step.type === "input" || step.type === "change") && step.value !== undefined) {
     const fieldKey = `${step.selector?.primary?.value || ""}::${step.relativePath || ""}`;
-    const isDup = state.lastRecordedFieldValue.get(fieldKey) === step.value;
-    console.log("[autotest][record][dedupe-check]", {
-      type: step.type,
-      value: step.value,
-      fieldKey,
-      previousValueForThisFieldKey: state.lastRecordedFieldValue.get(fieldKey) ?? null,
-      decision: isDup ? "SKIPPED as duplicate" : "recorded"
-    });
-    if (isDup) return true;
+    if (state.lastRecordedFieldValue.get(fieldKey) === step.value) return true;
     state.lastRecordedFieldValue.set(fieldKey, step.value);
     return false;
   }
@@ -636,7 +628,12 @@ function isLikelyUnstableFrameworkId(id) {
   // Matches both older Angular Material ids (mat-input-0, mat-checkbox-3)
   // and newer MDC-based ones (mat-mdc-checkbox-0-input) — "mat-" alone
   // covers both, since the latter is just "mat-" + "mdc-...".
-  return /^(mat-|cdk-|mdc-|mui-|radix-|chakra-|headlessui-|ember\d*-|react-select-)[\w-]*\d+/i.test(id)
+  // "ui-id-" is jQuery UI's widget factory (autocomplete/tabs/accordion/etc.)
+  // — it assigns ui-id-N from a single counter shared across every jQuery UI
+  // widget instantiated on the page, so N depends on page load order/timing
+  // and is not reproducible across sessions, even though it looks unique
+  // (and stable) within any one snapshot of the DOM.
+  return /^(mat-|cdk-|mdc-|mui-|radix-|chakra-|headlessui-|ember\d*-|react-select-|ui-id-)[\w-]*\d+/i.test(id)
     || /^:r[0-9a-z]+:$/i.test(id); // React 18 useId()
 }
 
@@ -2137,6 +2134,18 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
   const start = performance.now();
   while (performance.now() - start < timeoutMs) {
     let firstVisible = null; // first visible match, in candidate priority order — used if none are unique
+    // Lowest priority: unique right now, but via a framework auto-generated id
+    // (e.g. jQuery UI autocomplete's #ui-id-N). These are assigned from a
+    // counter shared across every such widget on the page, so the number is
+    // tied to page load order/timing, not to any specific option — it can
+    // (and does) point at a completely different element in a later session,
+    // even though it resolves to exactly one real element right now. This
+    // matters most for OLD recordings made before this candidate ordering
+    // existed, where the unstable id may still be stored as primary — this
+    // check demotes it at replay time too, so a better fallback (typically a
+    // text match on the option's actual visible label) gets tried first
+    // without needing to re-record.
+    let unstableIdMatch = null;
     for (const candidate of validCandidates) {
       const el = resolveBySelectorCandidate(candidate);
       if (!el) continue;
@@ -2154,7 +2163,9 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
         // with identical attributes, sending resolution all the way down to
         // the brittle XPath fallback for no real reason.
         const isUnique = candidate.type !== "css" || isUniqueMatchFor(el, candidate.value);
-        if (isUnique) {
+        const idMatch = candidate.type === "css" ? /^#([\w-]+)$/.exec(candidate.value) : null;
+        const isUnstableId = !!idMatch && isLikelyUnstableFrameworkId(idMatch[1]);
+        if (isUnique && !isUnstableId) {
           console.log(`[autotest][replay] ✓ Selector matched (visible, unique):`, {
             type: candidate?.type,
             value: candidate?.value?.substring?.(0, 100)
@@ -2162,13 +2173,18 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
           selectorAttempts.push({ candidate, found: true, visible: true, timestamp: Date.now() });
           return { el, used: candidate, selectorAttempts, visible: true };
         }
+        if (isUnique && isUnstableId) {
+          if (!unstableIdMatch) unstableIdMatch = { el, candidate };
+          continue; // keep looking for something more trustworthy this tick
+        }
         if (!firstVisible) firstVisible = { el, candidate };
       } else if (!bestHidden) {
         bestHidden = { el, candidate };
       }
     }
-    // No candidate uniquely matched this tick — fall back to the first
-    // visible match in priority order, same as before this uniqueness check.
+    // No trustworthy candidate uniquely matched this tick — fall back to the
+    // first ambiguous-but-visible match in priority order, and only then to
+    // an unstable-id match (better than nothing, but least trusted).
     if (firstVisible) {
       console.log(`[autotest][replay] ✓ Selector matched (visible, ambiguous — no unique candidate available):`, {
         type: firstVisible.candidate?.type,
@@ -2176,6 +2192,14 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
       });
       selectorAttempts.push({ candidate: firstVisible.candidate, found: true, visible: true, timestamp: Date.now() });
       return { el: firstVisible.el, used: firstVisible.candidate, selectorAttempts, visible: true };
+    }
+    if (unstableIdMatch) {
+      console.warn(`[autotest][replay] ⚠ Selector matched (visible, unique) but only via a framework auto-generated id — using as last resort:`, {
+        type: unstableIdMatch.candidate?.type,
+        value: unstableIdMatch.candidate?.value?.substring?.(0, 100)
+      });
+      selectorAttempts.push({ candidate: unstableIdMatch.candidate, found: true, visible: true, timestamp: Date.now() });
+      return { el: unstableIdMatch.el, used: unstableIdMatch.candidate, selectorAttempts, visible: true };
     }
     await nextFrame();
   }
@@ -2290,6 +2314,14 @@ const OVERLAY_INDICATOR_SELECTORS = [
 // cookie banners, etc.
 function isLikelyBlockingOverlay(el) {
   if (!el || !isElementVisible(el)) return false;
+  // AEM's author-mode editing placeholders ("drag components here" drop
+  // targets, e.g. .cq-placeholder/.afEditorPlaceholder) stay in the DOM even
+  // on published pages. They're normally-empty structural scaffolding, not a
+  // loading state — but one can inherit the same fixed/full-coverage/
+  // high-z-index styling as a real popup sitting next to it (no interactive
+  // content to otherwise exclude it), which made it look like a permanently
+  // stuck "loading overlay" that would never actually clear.
+  if (el.classList.contains('cq-placeholder') || el.classList.contains('afEditorPlaceholder')) return false;
   const style = window.getComputedStyle(el);
   if (style.position !== "fixed" && style.position !== "absolute") return false;
   const rect = el.getBoundingClientRect();
@@ -2698,6 +2730,47 @@ async function dismissOpenDialog() {
 
   await new Promise(r => setTimeout(r, 400));
   return true;
+}
+
+// AEM Forms' typeahead widget (guideDropDownList) hides the real <select>
+// (display:none) and shows a plain text <input> next to it — typing into
+// that input triggers a live search-as-you-type API call, and clicking a
+// resulting option sets the hidden select's value. Setting the whole value
+// in one shot (our normal fast path) never triggers that search at all, so
+// the option list never renders and a later click step meant to select from
+// it can't find anything. Detect this pattern by looking for a hidden
+// <select> among nearby ancestors.
+function isTypeaheadInput(el) {
+  if (!el || el.tagName?.toLowerCase() !== 'input') return false;
+  // jQuery UI autocomplete (and similar widgets) mark the input itself with
+  // a class like "ui-autocomplete-input" — no hidden <select> involved at
+  // all, so the AEM-style check below never catches it. Check this directly
+  // first since it's the cheapest, most reliable signal for that pattern.
+  if (/autocomplete|typeahead/i.test(el.className || '')) return true;
+  let node = el.parentElement;
+  for (let i = 0; i < 3 && node; i++, node = node.parentElement) {
+    const hiddenSelect = node.querySelector?.('select');
+    if (hiddenSelect && !isElementVisible(hiddenSelect)) return true;
+  }
+  return false;
+}
+
+// Types text one character at a time via execCommand('insertText'), firing a
+// real InputEvent per character — required for typeahead widgets that ignore
+// a bulk value assignment and only react to character-level input to
+// trigger their live search.
+async function typeCharByChar(el, text) {
+  el.focus();
+  if (el.value) {
+    el.setSelectionRange?.(0, el.value.length);
+    document.execCommand('selectAll', false);
+    document.execCommand('delete', false);
+  }
+  for (const char of String(text ?? "")) {
+    document.execCommand('insertText', false, char);
+    await new Promise((r) => setTimeout(r, 40));
+  }
+  el.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
 async function performStep(step) {
@@ -3496,14 +3569,25 @@ async function performStep(step) {
     el.focus();
 
     const targetValue = step?.value ?? "";
+
+    // Typeahead widgets need character-level typing to trigger their own
+    // live search — a one-shot value assignment never fires it, so the
+    // option list a later click step depends on would never render.
+    if (isTypeaheadInput(el)) {
+      console.log("[autotest][replay] Typeahead input detected — typing char-by-char:", targetValue);
+      await typeCharByChar(el, targetValue);
+      const postIdle = await waitForPageIdle();
+      if (!postIdle.ok) {
+        console.warn("[autotest][replay] Page still settling after typeahead typing, continuing:", postIdle.error);
+      }
+      return {
+        ok: true,
+        meta: { usedSelector: used },
+        debug: { ...consumeDebugBuffer(), selectorAttempts }
+      };
+    }
+
     const elDesc = describeElementForLog(el);
-    console.log("[autotest][replay][input-check] target element:", elDesc, {
-      id: el.id || null,
-      name: el.getAttribute?.('name') || null,
-      valueBefore: el.value,
-      targetValue,
-      matchedSameElementAsQuerySelector: el.id ? document.getElementById(el.id) === el : "no-id"
-    });
 
     // Use native input setter to bypass React's synthetic event system
     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
@@ -3517,39 +3601,29 @@ async function performStep(step) {
     } else {
       el.value = targetValue;
     }
-    console.log(`[autotest][replay][input-check] after native setter: el.value="${el.value}"`);
 
     el.dispatchEvent(new Event("input", { bubbles: true }));
-    console.log(`[autotest][replay][input-check] after "input" event: el.value="${el.value}"`);
-
     el.dispatchEvent(new Event("change", { bubbles: true }));
-    console.log(`[autotest][replay][input-check] after "change" event: el.value="${el.value}"`);
-
     el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
-    console.log(`[autotest][replay][input-check] after "blur" event: el.value="${el.value}"`);
 
     if (el.value !== targetValue) {
-      console.warn(`[autotest][replay][input-check] MISMATCH immediately after dispatch — expected "${targetValue}", got "${el.value}" on`, elDesc);
+      console.warn(`[autotest][replay] Value mismatch immediately after dispatch — expected "${targetValue}", got "${el.value}" on`, elDesc);
     }
 
     // Fire-and-forget delayed re-check: some frameworks (React controlled
     // inputs, AEM guide field validation) reset the value a tick or more
     // after blur — e.g. an onBlur validator that rejects the value and
     // clears it, or a duplicate/stale element getting the value while a
-    // different visible element is what's actually on screen. This doesn't
-    // block the step's return (kept fast, per the no-post-action-wait
-    // policy below) — it's purely diagnostic, logged after the fact.
+    // different visible element is what's actually on screen. Only logs if
+    // something actually went wrong — doesn't block the step's return.
     const capturedEl = el;
     setTimeout(() => {
       const laterValue = capturedEl.value;
-      const stillInDom = document.contains(capturedEl);
       if (laterValue !== targetValue) {
         console.warn(
-          `[autotest][replay][input-check] VALUE CHANGED AFTER STEP — 300ms later, expected "${targetValue}", found "${laterValue}" (element still in DOM: ${stillInDom}) on`,
+          `[autotest][replay] Value changed after step — 300ms later, expected "${targetValue}", found "${laterValue}" (element still in DOM: ${document.contains(capturedEl)}) on`,
           elDesc
         );
-      } else {
-        console.log(`[autotest][replay][input-check] value still correct 300ms later: "${laterValue}"`);
       }
     }, 300);
 
@@ -3998,22 +4072,6 @@ function learnFromRecordedStep(step) {
 function makeStep(type, target, value) {
   const { relativePath, queryParams } = computeRelativeLocation(window.location.href, state.baseUrl);
   let selector = generateSelector(target);
-  console.log("[autotest][record][selector]", {
-    type,
-    value,
-    target: target ? {
-      tag: target.tagName?.toLowerCase(),
-      id: target.id || null,
-      name: target.getAttribute?.('name') || null,
-      placeholder: target.getAttribute?.('placeholder') || null,
-      ariaLabel: target.getAttribute?.('aria-label') || null,
-      ariaLabelledby: target.getAttribute?.('aria-labelledby') || null,
-      classes: target.className || null
-    } : null,
-    primary: selector?.primary ? { type: selector.primary.type, value: selector.primary.value, reason: selector.primary.reason } : null,
-    fallbackCount: selector?.fallbacks?.length || 0,
-    fallbacks: (selector?.fallbacks || []).map(f => ({ type: f.type, value: f.value }))
-  });
   let matchInfo = null;
   
   // Extract element name/label for display
@@ -4573,21 +4631,9 @@ function handleClick(event) {
     const clickTime = Date.now();
     state.lastClickTarget = target;
     state.lastClickTime = clickTime;
-    console.log("[autotest][record][click-scheduled]", {
-      tag: tagName,
-      name: target.getAttribute?.('name') || null,
-      placeholder: target.getAttribute?.('placeholder') || null,
-      windowMs: CLICK_TO_INPUT_WINDOW_MS
-    });
 
     setTimeout(() => {
       if (state.lastClickTarget === target && state.lastClickTime === clickTime) {
-        console.log("[autotest][record][click-FIRED]", {
-          tag: tagName,
-          name: target.getAttribute?.('name') || null,
-          placeholder: target.getAttribute?.('placeholder') || null,
-          reason: "no input event cancelled it within the window — recorded as a CLICK step"
-        });
         flushPendingInput();
         sendStep(makeStep("click", target));
         state.lastClickSentAt = Date.now();
@@ -4639,42 +4685,16 @@ function handleInput(event) {
 
   // If input happens shortly after clicking the same element, cancel the pending click
   if (isSameAsClickedElement && timeSinceClick < CLICK_TO_INPUT_WINDOW_MS) {
-    console.log("[autotest][record][click-cancelled]", {
-      tag: target.tagName?.toLowerCase(),
-      name: target.getAttribute?.('name') || null,
-      placeholder: target.getAttribute?.('placeholder') || null,
-      timeSinceClick
-    });
     state.lastClickTarget = null;
     state.lastClickTime = 0;
-  } else if (state.lastClickTarget && !isSameAsClickedElement) {
-    console.log("[autotest][record][click-NOT-cancelled — different target]", {
-      inputTag: target.tagName?.toLowerCase(),
-      inputName: target.getAttribute?.('name') || null,
-      inputPlaceholder: target.getAttribute?.('placeholder') || null,
-      clickedTag: state.lastClickTarget.tagName?.toLowerCase?.() || null,
-      clickedName: state.lastClickTarget.getAttribute?.('name') || null,
-      clickedPlaceholder: state.lastClickTarget.getAttribute?.('placeholder') || null,
-      note: "the pending click was scheduled for a DIFFERENT element than this input — it will still fire as its own CLICK step"
-    });
   }
-  
+
   const step = makeStep(event.type, target, target.value);
 
   // Check if this is input on the same field as pending step
   const sameField = state.pendingInputStep &&
     state.pendingInputStep.selector?.primary?.value === step.selector?.primary?.value &&
     state.pendingInputStep.relativePath === step.relativePath;
-
-  console.log("[autotest][record][merge-check]", {
-    eventType: event.type,
-    newValue: step.value,
-    newPrimarySelector: step.selector?.primary?.value || null,
-    pendingValue: state.pendingInputStep?.value ?? null,
-    pendingPrimarySelector: state.pendingInputStep?.selector?.primary?.value || null,
-    sameField,
-    decision: sameField ? "MERGED into pending step (value overwritten, no new step)" : "NEW pending step (previous one flushed if any)"
-  });
 
   if (sameField) {
     // Update pending step with new value instead of creating new step
