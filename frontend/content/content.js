@@ -2747,6 +2747,14 @@ function isTypeaheadInput(el) {
   // all, so the AEM-style check below never catches it. Check this directly
   // first since it's the cheapest, most reliable signal for that pattern.
   if (/autocomplete|typeahead/i.test(el.className || '')) return true;
+  // AEM Forms' "Drop Down List" component (guideDropDownList) renders this
+  // way whenever it's *not* a plain <select> — including the API-backed
+  // lookup variant (e.g. an SM Code field with a REST data source), which
+  // has no hidden <select> fallback at all, just this bare <input>. Its
+  // id/name always carry the widget's "guidedropdownlist" token, so that's
+  // a reliable signal on its own, independent of the hidden-<select> check
+  // below (which only catches the local-options variant).
+  if (/guidedropdownlist/i.test(el.id || '') || /guidedropdownlist/i.test(el.name || '')) return true;
   let node = el.parentElement;
   for (let i = 0; i < 3 && node; i++, node = node.parentElement) {
     const hiddenSelect = node.querySelector?.('select');
@@ -2767,8 +2775,13 @@ async function typeCharByChar(el, text) {
     document.execCommand('delete', false);
   }
   for (const char of String(text ?? "")) {
+    const code = char.charCodeAt(0);
+    const keyEventInit = { key: char, bubbles: true, cancelable: true, keyCode: code, which: code };
+    el.dispatchEvent(new KeyboardEvent("keydown", keyEventInit));
+    el.dispatchEvent(new KeyboardEvent("keypress", keyEventInit));
     document.execCommand('insertText', false, char);
-    await new Promise((r) => setTimeout(r, 40));
+    el.dispatchEvent(new KeyboardEvent("keyup", keyEventInit));
+    await new Promise((r) => setTimeout(r, 150));
   }
   el.dispatchEvent(new Event("change", { bubbles: true }));
 }
