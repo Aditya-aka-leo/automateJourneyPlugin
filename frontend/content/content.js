@@ -2132,6 +2132,7 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
   let bestHidden = null; // first found-but-not-yet-visible match, kept as a fallback result
 
   const start = performance.now();
+  let lastHeartbeat = start;
   while (performance.now() - start < timeoutMs) {
     let firstVisible = null; // first visible match, in candidate priority order — used if none are unique
     // Lowest priority: unique right now, but via a framework auto-generated id
@@ -2200,6 +2201,21 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
       });
       selectorAttempts.push({ candidate: unstableIdMatch.candidate, found: true, visible: true, timestamp: Date.now() });
       return { el: unstableIdMatch.el, used: unstableIdMatch.candidate, selectorAttempts, visible: true };
+    }
+
+    // Nothing matched this tick — surface what we're still waiting on every
+    // few seconds so a stuck step is diagnosable from the live console
+    // instead of only after the full timeout elapses.
+    const nowHb = performance.now();
+    if (nowHb - lastHeartbeat > 3000) {
+      lastHeartbeat = nowHb;
+      console.log(`[autotest][replay] ⏳ Still looking for element after ${Math.round((nowHb - start) / 1000)}s`, {
+        primary: selector.primary?.value?.substring?.(0, 100) || selector.primary?.type,
+        candidatesTried: validCandidates.map((c) => `${c.type}:${String(c.value ?? "").substring(0, 60)}`),
+        bestHiddenMatch: bestHidden
+          ? { selector: `${bestHidden.candidate?.type}:${String(bestHidden.candidate?.value ?? "").substring(0, 60)}`, el: describeElementForLog(bestHidden.el) }
+          : null
+      });
     }
     await nextFrame();
   }
@@ -2386,6 +2402,16 @@ function findVisibleLoadingIndicator() {
       if (isExtensionUiTarget(el)) continue;
       if (!isElementVisible(el)) continue;
       if (containsInteractiveFormContent(el)) continue;
+      // "overlay"/"backdrop" class names also show up on small decorative
+      // elements with no relation to page-blocking state — e.g. a masked-value
+      // span like class="mask-overlay" showing "*****1234" next to a PAN/
+      // account field. A genuine blocking overlay covers a meaningful part of
+      // the viewport, so require that before trusting the name match, same as
+      // the name-agnostic backstop below.
+      const rect = el.getBoundingClientRect();
+      const viewportArea = window.innerWidth * window.innerHeight;
+      const coverage = viewportArea > 0 ? (rect.width * rect.height) / viewportArea : 0;
+      if (coverage < 0.15) continue;
       return el;
     }
   }
@@ -2408,9 +2434,18 @@ async function waitForNoLoadingIndicator({
   timeoutMs = DEFAULT_WAIT.loadingIndicatorTimeoutMs
 } = {}) {
   const start = performance.now();
+  let lastHeartbeat = start;
   while (performance.now() - start < timeoutMs) {
     const indicator = findVisibleLoadingIndicator();
     if (!indicator) return { ok: true };
+    const now = performance.now();
+    if (now - lastHeartbeat > 3000) {
+      lastHeartbeat = now;
+      console.log(`[autotest][replay] ⏳ Still blocked by a loading indicator after ${Math.round((now - start) / 1000)}s`, {
+        indicator: describeElementForLog(indicator),
+        text: getElementText(indicator).substring(0, 100)
+      });
+    }
     await nextFrame();
   }
   return { ok: false, error: "A loading indicator is still visible after timeout.", code: "LOADER_STILL_VISIBLE" };
@@ -3265,9 +3300,15 @@ async function performStep(step) {
       await new Promise(resolve => setTimeout(resolve, 60));
       
       // Check if the page is about to reload (URL unchanged = SPA should have
-      // handled it; if DOM hasn't changed, React handler likely didn't fire)
+      // handled it; if DOM hasn't changed, React handler likely didn't fire).
+      // A click that correctly opened a confirm dialog ("Are you sure you
+      // want to leave?") is expected to leave the URL unchanged too — it's
+      // not supposed to navigate until the user answers. Escalating in that
+      // case (extra React fiber invocation, then a synthetic Enter keypress
+      // fired at clickTarget) risks landing that Enter on whatever the new
+      // dialog focused instead, silently dismissing it right after it opened.
       const urlAfter = window.location.href;
-      if (urlAfter === urlBefore) {
+      if (urlAfter === urlBefore && !getOpenDialog()) {
         // Try direct React fiber invocation as a second attempt
         const reactHandled = tryReactOnClick(clickTarget);
         if (!reactHandled) {

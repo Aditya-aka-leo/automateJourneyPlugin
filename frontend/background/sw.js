@@ -1125,6 +1125,50 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         chrome.tabs.update(activeTabId, { active: true }).catch(() => {});
       }
 
+      // ── Same-tab cross-origin redirect (no tabIndex change) ────────────────
+      // Recording never emits an explicit "navigation" step for a hard
+      // (full-page) redirect — content.js only hooks pushState/replaceState/
+      // popstate/hashchange (see handleNavigation), and a real cross-origin
+      // redirect unloads the page before any of those can fire. This is
+      // exactly what happens handing off from the HDFC form to a third-party
+      // KYC vendor (Perfios, etc.) and back — the step right after the
+      // redirect still carries the new tabDomain, but nothing tells the loop
+      // below to expect a domain change on the SAME tab.
+      // Without this check, the ping-and-reinject logic a few lines down can
+      // catch the old page's content script still alive mid-navigation, then
+      // immediately search it for the next step's (wrong-page) selector —
+      // which reliably fails only after burning the full 10-minute
+      // element-search timeout in content.js. Waiting for the tab to actually
+      // reach the expected domain first turns that into a fast, correctly
+      // diagnosed failure (or just a short, correct wait) instead.
+      if (stepTabIndex === currentTabIndex && step.tabDomain) {
+        let currentDomain = null;
+        try {
+          const currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
+          if (currentTab?.url) currentDomain = new URL(currentTab.url).hostname;
+        } catch (_) {}
+
+        if (currentDomain && step.tabDomain !== currentDomain) {
+          console.log(`[autotest][replay] Step ${i} expects domain "${step.tabDomain}" but tab is on "${currentDomain}" — waiting for redirect to complete…`);
+          const settledTab = await waitForTabWithDomain(step.tabDomain, 30000);
+          if (!settledTab) {
+            const err = new Error(`Expected the page to redirect to "${step.tabDomain}" but it never did within 30s (still on "${currentDomain}"). The preceding step likely didn't trigger the expected hand-off.`);
+            err.code = "DOMAIN_REDIRECT_TIMEOUT";
+            stepReport.status = "failed";
+            stepReport.error = { message: err.message, code: err.code };
+            lastReportByTab.set(tabId, report);
+            throw err;
+          }
+          console.log(`[autotest][replay] Step ${i}: Tab reached expected domain "${step.tabDomain}"`);
+          try {
+            await ensureContentScriptsInjected(activeTabId);
+            await new Promise(r => setTimeout(r, 300));
+          } catch (injErr) {
+            console.warn("[autotest][replay] Could not inject content scripts after cross-origin redirect:", injErr?.message);
+          }
+        }
+      }
+
       // ── Pre-register tab watcher for the next step if it needs a same-domain switch ──
       // We start waitForNewTabCreated HERE (before executing the current step) so
       // its onCreated listener is in place when the click fires and opens the new tab.
@@ -2452,6 +2496,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       };
       recordings.push(recording);
       await saveRecordings(recordings);
+
+      console.log("[autotest][recording-debug] Recording saved:", recording);
+      console.log("[autotest][recording-debug] Copy this JSON:\n" + JSON.stringify(recording, null, 2));
 
       return { ok: true, recording };
     }
