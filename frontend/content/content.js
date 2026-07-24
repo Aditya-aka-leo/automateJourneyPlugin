@@ -4792,6 +4792,21 @@ function handleInput(event) {
 function handleSubmit(event) {
   if (!state.isRecording) return;
   if (isExtensionUiTarget(event.target)) return;
+
+  // A <button type="submit"> inside a <form> fires this native "submit"
+  // event as an automatic side-effect of the click already recorded a
+  // moment ago. Recording it as its own step would replay as TWO
+  // submissions of the same form — once from the click's own default
+  // action, once from this step's form.requestSubmit() — which can double
+  // a downstream call (e.g. re-sending an OTP) or hit a form the SPA has
+  // already torn down after the first submit. Same rationale as the
+  // pushState/replaceState suppression in handleNavigation below.
+  const timeSinceClick = Date.now() - (state.lastClickSentAt || 0);
+  if (timeSinceClick < CLICK_NAV_SUPPRESS_MS) {
+    console.log("[autotest][record] Suppressing submit event —", timeSinceClick + "ms after click (native side-effect of the submit button)");
+    return;
+  }
+
   flushPendingInput(); // Flush any pending input before submit
   sendStep(makeStep("submit", event.target));
 }
