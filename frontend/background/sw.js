@@ -381,7 +381,15 @@ function waitForTabLoad(tabId, timeoutMs = 60000) {
 
 // Waits up to timeoutMs for any tab to load whose hostname matches domain.
 // Also checks existing tabs immediately in case the tab already loaded before this is called.
-function waitForTabWithDomain(domain, timeoutMs = 30000) {
+//
+// Scoped to `windowId` (the replay's own window) when provided — matching
+// against every tab in the entire browser is unsafe: a same-hostname tab
+// left open in a DIFFERENT window from an unrelated recording/session (e.g.
+// a leftover tab from testing a different journey) would be silently
+// adopted as "the" redirect target, hijacking replay onto the wrong tab
+// even though the hostname genuinely matches. windowId is only omitted when
+// no origin tab could be resolved, as a last-resort fallback.
+function waitForTabWithDomain(domain, timeoutMs = 30000, windowId = null) {
   return new Promise((resolve) => {
     let settled = false;
     function done(tab) {
@@ -394,10 +402,11 @@ function waitForTabWithDomain(domain, timeoutMs = 30000) {
     const timer = setTimeout(() => done(null), timeoutMs);
     function onUpdated(id, info, tab) {
       if (info.status !== 'complete' || !tab.url) return;
+      if (windowId != null && tab.windowId !== windowId) return;
       try { if (new URL(tab.url).hostname === domain) done(tab); } catch (_) {}
     }
     chrome.tabs.onUpdated.addListener(onUpdated);
-    chrome.tabs.query({}).then(tabs => {
+    chrome.tabs.query(windowId != null ? { windowId } : {}).then(tabs => {
       for (const tab of tabs) {
         if (tab.status === 'complete' && tab.url) {
           try { if (new URL(tab.url).hostname === domain) { done(tab); return; } } catch (_) {}
@@ -541,6 +550,23 @@ function buildReplayUrl(env, step) {
     throw new Error("Selected environment has no baseUrl.");
   }
   const url = new URL(baseUrl);
+
+  // Environments are a flat, global list shared across every recording in
+  // this extension install (see ENV_KEY) — resolveEnvForStep() can fall
+  // through to a default environment that has nothing to do with the
+  // journey being replayed (e.g. one auto-created from a completely
+  // unrelated recording/domain visited at some point in this browser).
+  // Since step.tabDomain records the actual domain this step was recorded
+  // against, cross-checking it here is a last line of defense: it turns a
+  // silent "navigate to the wrong site" into a clear, immediate error
+  // instead of quietly combining a wrong origin with this step's (correct)
+  // relativePath into a URL that looks plausible but points nowhere useful.
+  if (step?.tabDomain && url.hostname !== step.tabDomain) {
+    throw new Error(
+      `Environment "${env?.name || env?.id || "?"}" (${url.hostname}) does not match this step's recorded domain "${step.tabDomain}". Refusing to navigate to avoid combining the wrong site with this step's path — check that the correct environment is selected for this recording.`
+    );
+  }
+
   const rel = String(step?.relativePath || "/");
   const joinedPath = rel.startsWith("/") ? rel : `/${rel}`;
   url.pathname = joinPaths(url.pathname, joinedPath);
@@ -553,6 +579,11 @@ function buildReplayUrl(env, step) {
       url.searchParams.append(key, String(values));
     }
   }
+  // Some sites route/render based on the URL hash (e.g. an "#addon" section
+  // that only loads once that fragment is present) — dropping it here would
+  // build a URL that "looks" like a match on path+query alone but never
+  // triggers the actual content this step needs.
+  url.hash = String(step?.hash || "");
   return url.toString();
 }
 
@@ -839,6 +870,11 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
   replayLocks.set(tabId, true);
   activeReplayTabId = tabId;
   activeReplayOriginTabId = tabId;
+  // Scopes cross-tab domain matching (waitForTabWithDomain) to this replay's
+  // own window, so an unrelated same-hostname tab left open elsewhere (a
+  // different recording's leftover tab, a manually opened tab, etc.) can't
+  // get silently adopted as the redirect target.
+  const replayWindowId = (await chrome.tabs.get(tabId).catch(() => null))?.windowId ?? null;
   const report = buildReport({ envId: env?.id || null, steps, recordingId });
   lastReportByTab.set(tabId, report); // Store initial report
   
@@ -1083,7 +1119,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           } catch (_) {}
 
           if (stepDomain && stepDomain !== currentDomain) {
-            newTab = await waitForTabWithDomain(stepDomain, 30000);
+            newTab = await waitForTabWithDomain(stepDomain, 30000, replayWindowId);
           } else if (pendingNewTabWatcher) {
             // Listener was pre-registered before the triggering step — guaranteed
             // to have caught the tab even if it opened before this code runs.
@@ -1150,7 +1186,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
 
         if (currentDomain && step.tabDomain !== currentDomain) {
           console.log(`[autotest][replay] Step ${i} expects domain "${step.tabDomain}" but tab is on "${currentDomain}" — waiting for redirect to complete…`);
-          const settledTab = await waitForTabWithDomain(step.tabDomain, 30000);
+          const settledTab = await waitForTabWithDomain(step.tabDomain, 30000, replayWindowId);
           if (!settledTab) {
             const err = new Error(`Expected the page to redirect to "${step.tabDomain}" but it never did within 30s (still on "${currentDomain}"). The preceding step likely didn't trigger the expected hand-off.`);
             err.code = "DOMAIN_REDIRECT_TIMEOUT";
@@ -1972,15 +2008,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     if (type === "patch_step_path") {
       // Fired when content.js suppresses a click-triggered SPA navigation
-      // (pushState/replaceState) — the step itself already recorded, but its
-      // relativePath/queryParams still reflect the pre-navigation page. This
-      // patches the in-progress step to the page it actually landed on.
+      // (pushState/replaceState/popstate/hashchange) — the step itself
+      // already recorded, but its relativePath/queryParams/hash still
+      // reflect the pre-navigation page. This patches the in-progress step
+      // to the page it actually landed on.
       if (tabId == null) return { ok: false, error: "NO_TAB" };
       const list = getStepsForTab(tabId);
       const step = list.find((s) => s.id === message?.stepId);
       if (step) {
         if (typeof message.relativePath === "string") step.relativePath = message.relativePath;
         if (message.queryParams) step.queryParams = message.queryParams;
+        if (typeof message.hash === "string") step.hash = message.hash;
         try {
           await chrome.tabs.sendMessage(tabId, { type: "hud_recording_update", steps: [...list] });
         } catch (_) { /* HUD may not be active */ }

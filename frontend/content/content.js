@@ -505,7 +505,14 @@ function computeRelativeLocation(urlString, baseUrlString) {
     queryParams[key].push(value);
   }
 
-  return { relativePath, queryParams };
+  // Some sites use the URL hash for routing/state (e.g. an "#addon" section
+  // that only renders once that fragment is present), not just in-page
+  // anchors. Dropping it here would silently replay against a URL that
+  // never loads that section, even though relativePath/queryParams both
+  // "match" — the fragment is the part that actually mattered.
+  const hash = url.hash || "";
+
+  return { relativePath, queryParams, hash };
 }
 
 function getVisibleText(el) {
@@ -522,25 +529,34 @@ function getVisibleText(el) {
  * This is used for text-based selectors and element names to ensure they
  * remain valid across replays when dynamic values change.
  */
-function getStableLabel(el) {
-  if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
-  
-  // Priority: aria-label > explicit label > first heading/strong text > cleaned full text
-  const ariaLabel = el.getAttribute('aria-label');
-  if (ariaLabel) return ariaLabel.trim();
-  
-  // Check for a heading or strong child with stable text
-  const headingOrStrong = el.querySelector('h1,h2,h3,h4,h5,h6,strong,b,.title,.heading,.name,.label');
-  if (headingOrStrong) {
-    const headText = (headingOrStrong.textContent || "").trim();
-    if (headText && headText.length <= 60) return headText;
+// Counts elements on the page whose own trimmed text matches `text`
+// (case-insensitive) — used to tell a genuinely identifying label apart
+// from generic boilerplate copy that's repeated across every instance of a
+// repeated component (e.g. a tooltip/benefit caption present on every card
+// in a list).
+function _countTextOccurrences(text) {
+  if (!text) return 0;
+  const wantedLower = text.trim().toLowerCase();
+  if (!wantedLower) return 0;
+  let count = 0;
+  const nodes = document.querySelectorAll(
+    "button, a, label, [role], [aria-label], span, div, h1, h2, h3, h4, h5, h6, strong, b"
+  );
+  for (const node of nodes) {
+    if (String(node.textContent || "").trim().toLowerCase() === wantedLower) count++;
   }
-  
-  const raw = String(el.textContent || "").trim();
-  if (!raw) return "";
-  
-  // Strip dynamic patterns: currency amounts, percentages, large numbers, dates
-  let cleaned = raw
+  return count;
+}
+
+// Strips currency amounts, percentages, large numbers, times, and dates from
+// text so the result stays stable across replays (a price/date/count that
+// happens to be correct at record time won't be at replay time). Shared by
+// every getStableLabel() candidate — including the heading/label-descendant
+// path, not just the final whole-element fallback — since a promotional
+// badge or tooltip can just as easily be JUST a raw price (e.g. "₹23,960")
+// as a whole card's assembled text can.
+function _stripDynamicText(raw) {
+  return String(raw || "")
     // Currency: ₹3,958+, $29.99, €100, £50.00, etc.
     .replace(/[₹$€£¥]\s*[\d,]+\.?\d*/g, '')
     // Standalone numbers with commas/decimals: 3,958, 1234.56
@@ -558,10 +574,82 @@ function getStableLabel(el) {
     // Collapse whitespace
     .replace(/\s+/g, ' ')
     .trim();
-  
+}
+
+function getStableLabel(el) {
+  if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
+
+  // Priority: aria-label > explicit label > first heading/strong text > cleaned full text
+  const ariaLabel = el.getAttribute('aria-label');
+  if (ariaLabel) return ariaLabel.trim();
+
+  // Above this, a candidate isn't "identifying" anymore. This has to be
+  // strict equality with 1, not just "a small number" — a short, generic
+  // word colliding with even ONE unrelated element elsewhere on the page is
+  // already a real bug, not just a repeated-component edge case: e.g. a
+  // fare-tier control labeled "Low" and a completely unrelated "Low"-labeled
+  // link to a fees-and-charges info page are two different elements that
+  // happen to share the same short text — resolveByText()'s exact-match
+  // phase deterministically picks whichever comes first in DOM order, which
+  // may well be the wrong one. Applied to every candidate path below, not
+  // just the heading/label one.
+  const MAX_ACCEPTABLE_LABEL_REPETITION = 1;
+
+  // Consider every heading/strong/.title/.heading/.name/.label descendant,
+  // not just the first one — a component can contain more than one (e.g. a
+  // generic tooltip/benefit caption that's identical on every sibling card,
+  // plus the element's own specific name further down). Blindly taking the
+  // first match can silently pick the generic, page-wide-repeated one,
+  // making every sibling's "stable label" collide with each other instead
+  // of identifying this specific element. Prefer whichever candidate's text
+  // is least repeated elsewhere on the page.
+  const labelCandidates = el.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,b,.title,.heading,.name,.label');
+  if (labelCandidates.length > 0) {
+    let best = null;
+    let bestCount = Infinity;
+    for (const cand of labelCandidates) {
+      const headText = _stripDynamicText((cand.textContent || "").trim());
+      if (!headText || headText.length > 60) continue;
+      const count = _countTextOccurrences(headText);
+      if (count > 0 && count < bestCount) {
+        best = headText;
+        bestCount = count;
+        if (bestCount <= 1) break; // can't do better than unique
+      }
+    }
+    if (best && bestCount <= MAX_ACCEPTABLE_LABEL_REPETITION) return best;
+  }
+
+  const raw = String(el.textContent || "").trim();
+  if (!raw) return "";
+
+  const cleaned = _stripDynamicText(raw);
+
   if (!cleaned) return "";
-  // Keep it short
-  return cleaned.length > 60 ? cleaned.slice(0, 57) + "..." : cleaned;
+  // Reject (rather than truncate) text past this length. This value is used
+  // as a match target by resolveByText(), whose fuzzy phase matches via
+  // substring containment — and a long, multi-field blob like a whole
+  // card's concatenated text is very likely to ALSO be a substring of one
+  // of el's own ancestors (which trivially contain all their descendants'
+  // text plus more), so instead of identifying this specific element it
+  // can resolve to some much larger wrapping container. Truncating with a
+  // "..." marker doesn't fix this either — that marker never appears in
+  // real DOM text at the exact cut point, so it would just fail to match
+  // anything at all. Only text short enough to plausibly belong to one
+  // specific element (a button/link label, not an assembled card) is
+  // trustworthy here; return no candidate at all otherwise so
+  // generateSelector falls back to a structural selector (CSS/XPath)
+  // instead of a misleading text one.
+  if (cleaned.length > 60) return "";
+
+  // Same repetition guard as the heading/label path above, applied here too
+  // — a short, generic whole-element text (e.g. a lone sort-toggle word
+  // like "Low") is just as capable of colliding with unrelated content
+  // elsewhere on the page as a repeated tooltip caption is.
+  const occurrences = _countTextOccurrences(cleaned);
+  if (occurrences > MAX_ACCEPTABLE_LABEL_REPETITION) return "";
+
+  return cleaned;
 }
 
 function cssEscape(value) {
@@ -624,6 +712,26 @@ function isUniqueMatchFor(el, cssValue) {
 // data, conditional branches, lazy-loaded modules). It's still unique *right
 // now*, so treating it as a top-priority "stable id" selector works during
 // recording and then silently points at the wrong element (or nothing) later.
+// Walks up from el looking for the nearest ancestor with a stable identity
+// (a non-framework id or a data-testid-style attribute) to anchor a
+// structural selector to, so it can't collide with the same structure
+// repeated elsewhere on the page (e.g. a list of cards that each contain
+// their own copy of the element being targeted).
+function findStableAncestorSelector(el, maxDepth) {
+  let node = el.parentElement;
+  for (let i = 0; i < maxDepth && node; i++) {
+    if (node.id && !isLikelyUnstableFrameworkId(node.id)) {
+      return `#${cssEscape(node.id)}`;
+    }
+    for (const attr of ["data-testid", "data-test", "data-test-id"]) {
+      const val = node.getAttribute(attr);
+      if (val) return `[${attr}="${escapeAttributeValue(val)}"]`;
+    }
+    node = node.parentElement;
+  }
+  return null;
+}
+
 function isLikelyUnstableFrameworkId(id) {
   // Matches both older Angular Material ids (mat-input-0, mat-checkbox-3)
   // and newer MDC-based ones (mat-mdc-checkbox-0-input) — "mat-" alone
@@ -633,8 +741,44 @@ function isLikelyUnstableFrameworkId(id) {
   // widget instantiated on the page, so N depends on page load order/timing
   // and is not reproducible across sessions, even though it looks unique
   // (and stable) within any one snapshot of the DOM.
-  return /^(mat-|cdk-|mdc-|mui-|radix-|chakra-|headlessui-|ember\d*-|react-select-|ui-id-)[\w-]*\d+/i.test(id)
-    || /^:r[0-9a-z]+:$/i.test(id); // React 18 useId()
+  if (/^(mat-|cdk-|mdc-|mui-|radix-|chakra-|headlessui-|ember\d*-|react-select-|ui-id-)[\w-]*\d+/i.test(id)) return true;
+  if (/^:r[0-9a-z]+:$/i.test(id)) return true; // React 18 useId()
+
+  // Generic backstop for frameworks/CMSes not covered by the known-prefix
+  // list above — e.g. AEM/site-specific ids like "dynamicpage-30d734ff40".
+  // A trailing run of hex-only characters this long is very unlikely to
+  // appear in a hand-authored id; it's almost always an opaque per-render
+  // or per-session hash, which carries the exact same risk as a known
+  // framework's auto-generated id (unique right now, not guaranteed to
+  // reproduce next time).
+  if (/-[0-9a-f]{6,}$/i.test(id)) return true;
+
+  return false;
+}
+
+// Detects class names that encode a transient UI STATE rather than the
+// element's identity — e.g. react-date-range's "rdrDayHovered", applied to
+// a calendar day only while the mouse is actively over it. It happened to
+// be present (and even "unique") at record time purely because the
+// recorder's cursor was on that cell, not because it identifies the cell;
+// trusting it bakes in a class that won't exist at replay time. The
+// original exact-match check (class === "hover") missed compound names like
+// this because they're a whole word glued onto a prefix, not the whole
+// class string — so this splits camelCase/kebab-case/snake_case into words
+// and checks the LAST one, which is where a library's state suffix lives
+// (contrast with a BEM-style class like "selected-fare", where "selected"
+// is a leading modifier describing the component's fixed purpose, not a
+// toggled state — the check deliberately only looks at the last word so it
+// doesn't misfire on names like that).
+function _isEphemeralStateClass(cls) {
+  const words = String(cls || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((w) => w.toLowerCase());
+  if (words.length === 0) return false;
+  const lastWord = words[words.length - 1];
+  return /^(hover|hovered|active|selected|focus|focused|disabled|error|highlighted|current)$/.test(lastWord);
 }
 
 function generateSelector(el) {
@@ -767,8 +911,8 @@ function generateSelector(el) {
   }
   
   // Class-based selector (if classes exist and are reasonable)
-  const classes = Array.from(el.classList).filter(c => 
-    c && !c.match(/^(active|selected|hover|focus|disabled|error)$/i) && c.length < 50
+  const classes = Array.from(el.classList).filter(c =>
+    c && !_isEphemeralStateClass(c) && c.length < 50
   );
   if (classes.length > 0 && classes.length <= 3) {
     candidates.push({
@@ -780,20 +924,39 @@ function generateSelector(el) {
 
   // 3.7) Structural selector: nth-of-type for role-based siblings
   // When multiple elements share the same role (e.g. fare radio buttons),
-  // use nth-of-type to distinguish them stably (independent of text content)
+  // use nth-of-type to distinguish them stably (independent of text content).
   if (role) {
     const parent = el.parentElement;
     if (parent) {
-      const siblings = Array.from(parent.querySelectorAll(`:scope > ${tag}[role="${escapeAttributeValue(role)}"]`));
-      if (siblings.length > 1) {
-        const idx = siblings.indexOf(el);
-        if (idx >= 0) {
-          candidates.push({
-            type: "css",
-            value: `${tag}[role="${escapeAttributeValue(role)}"]:nth-of-type(${idx + 1})`,
-            reason: `Structural position among ${siblings.length} sibling ${role} elements.`
-          });
-        }
+      // :nth-of-type counts siblings by TAG NAME ONLY, ignoring the rest of
+      // the compound selector (including [role=...]) — the index has to be
+      // computed the same way, or the generated selector can land on the
+      // wrong sibling (or match nothing) whenever a differently-roled
+      // element of the same tag sits between the role-matching ones.
+      const tagSiblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+      const idx = tagSiblings.indexOf(el);
+      const roleSiblingCount = tagSiblings.filter(s => s.getAttribute("role") === role).length;
+      if (idx >= 0 && roleSiblingCount > 1) {
+        const structuralSelector = `${tag}[role="${escapeAttributeValue(role)}"]:nth-of-type(${idx + 1})`;
+        // Unscoped, this is dangerous on pages with repeated components —
+        // e.g. a list of flight cards that each render their own pair of
+        // fare radios. CSS resolves :nth-of-type per immediate parent, so
+        // the same selector string independently matches the Nth radio in
+        // EVERY card, not just this one: a selector that looked unique at
+        // record time (only one card rendered/visible then) silently
+        // becomes ambiguous once the full list is on the page at replay
+        // time. Anchor it to the nearest ancestor with a stable identity
+        // when one exists; otherwise keep it as a low-priority fallback so
+        // a more reliable candidate (text label, XPath) is tried first.
+        const ancestorScope = findStableAncestorSelector(el, 6);
+        candidates.push({
+          type: "css",
+          value: ancestorScope ? `${ancestorScope} ${structuralSelector}` : structuralSelector,
+          reason: ancestorScope
+            ? `Structural position among sibling ${role} elements, scoped to a stable ancestor.`
+            : `Structural position among sibling ${role} elements — unscoped, so ranked low-priority since it can collide with the same structure elsewhere on the page.`,
+          lowPriority: !ancestorScope
+        });
       }
     }
   }
@@ -1770,6 +1933,18 @@ function isElementVisible(el) {
   return rect.width > 0 && rect.height > 0;
 }
 
+// Finds the nearest visible, clickable ancestor of a hidden element — used
+// to try "opening" a collapsed field wrapper whose inner control (e.g. an
+// airport-search combobox) only renders visibly once the wrapper itself is
+// clicked. Starts the search from hiddenEl itself via closest(), so it
+// naturally returns the FIRST matching ancestor, not just any one.
+function findRevealableAncestor(hiddenEl) {
+  if (!hiddenEl) return null;
+  const clickable = hiddenEl.closest?.('button, a, [role="button"], [onclick]');
+  if (clickable && clickable !== hiddenEl && isElementVisible(clickable)) return clickable;
+  return null;
+}
+
 /**
  * Strip dynamic content (prices, numbers, dates, etc.) from text for comparison.
  */
@@ -2130,6 +2305,8 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
   // one poll interval instead of after several seconds of wasted waiting.
   const selectorAttempts = [];
   let bestHidden = null; // first found-but-not-yet-visible match, kept as a fallback result
+  let hiddenSince = null; // when bestHidden was first observed, for the reveal-ancestor grace period below
+  let revealAttempted = false; // try the ancestor-click reveal at most once per call
 
   const start = performance.now();
   let lastHeartbeat = start;
@@ -2181,6 +2358,7 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
         if (!firstVisible) firstVisible = { el, candidate };
       } else if (!bestHidden) {
         bestHidden = { el, candidate };
+        hiddenSince = performance.now();
       }
     }
     // No trustworthy candidate uniquely matched this tick — fall back to the
@@ -2217,6 +2395,29 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
           : null
       });
     }
+
+    // A resolvable-but-permanently-hidden target usually means the recorded
+    // step skipped an intermediate "open this" click — e.g. a collapsed
+    // field wrapper whose inner input/combobox doesn't exist visibly until
+    // the wrapper itself is clicked (this can happen if that wrapper was
+    // already open at record time, so only the inner control's click got
+    // captured). Without this, such a step would wait out the ENTIRE
+    // timeout with literally no way to ever succeed, since nothing is
+    // driving the wrapper open. Try clicking the nearest visible clickable
+    // ancestor once, after a short grace period (so we don't preempt a
+    // panel that's just mid-animation), and let the normal polling above
+    // pick up the target once it becomes visible.
+    if (bestHidden && !revealAttempted && hiddenSince != null && nowHb - hiddenSince > 2000) {
+      revealAttempted = true;
+      const ancestor = findRevealableAncestor(bestHidden.el);
+      if (ancestor) {
+        console.log("[autotest][replay] Target matched but stayed hidden — attempting to reveal via ancestor click:", describeElementForLog(ancestor));
+        try {
+          dispatchRealClick(ancestor);
+        } catch (_) {}
+      }
+    }
+
     await nextFrame();
   }
 
@@ -2367,6 +2568,24 @@ function containsInteractiveFormContent(el) {
   }
 }
 
+// A <video> player's own seek/scrubber bar carries role="progressbar" for
+// accessibility (e.g. a promo video embedded in a marketing carousel), but
+// it has nothing to do with page-loading state. While the video is paused
+// or hasn't started, it sits at aria-valuenow="0" indefinitely — visible,
+// unchanging, and matching [role="progressbar"] forever — which would make
+// waitForNoLoadingIndicator block on it for the entire timeout on a page
+// that actually finished loading long ago. Video player widgets are shallow,
+// self-contained components, so a bounded ancestor walk reliably finds the
+// <video> element the bar controls without scanning the whole page.
+function isVideoScrubber(el) {
+  let node = el;
+  for (let i = 0; i < 6 && node; i++) {
+    if (node.querySelector && node.querySelector('video')) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
 function findVisibleLoadingIndicator() {
   for (const sel of LOADING_INDICATOR_SELECTORS) {
     let els;
@@ -2379,6 +2598,7 @@ function findVisibleLoadingIndicator() {
       if (isExtensionUiTarget(el)) continue; // Ignore our own HUD/panel.
       if (!isElementVisible(el)) continue;
       if (containsInteractiveFormContent(el)) continue;
+      if (isVideoScrubber(el)) continue;
       return el;
     }
   }
@@ -4124,7 +4344,7 @@ function learnFromRecordedStep(step) {
 }
 
 function makeStep(type, target, value) {
-  const { relativePath, queryParams } = computeRelativeLocation(window.location.href, state.baseUrl);
+  const { relativePath, queryParams, hash } = computeRelativeLocation(window.location.href, state.baseUrl);
   let selector = generateSelector(target);
   let matchInfo = null;
   
@@ -4224,6 +4444,7 @@ function makeStep(type, target, value) {
     timestamp: Date.now(),
     relativePath,
     queryParams,
+    hash,
     selector,
     value: value ?? null,
     elementName, // Store element name for display
@@ -4813,24 +5034,39 @@ function handleSubmit(event) {
 
 /**
  * Time window (ms) after a click within which we suppress pushState /
- * replaceState navigation recordings.  In React SPAs and micro-frontend
- * architectures, clicking a button often triggers history.pushState as
- * part of the SPA transition.  Recording this as a separate "navigation"
- * step would cause a full page reload during replay, which is wrong —
- * the click step alone is sufficient to trigger the SPA transition.
+ * replaceState / popstate / hashchange navigation recordings.  In React SPAs
+ * and micro-frontend architectures, clicking a button often triggers one of
+ * these as part of the SPA transition — e.g. a "Next" button that internally
+ * calls history.back()/history.pushState() to close a step/modal and advance
+ * a wizard.  Recording this as a separate "navigation" step is not just
+ * redundant, it's actively worse: replaying it means reconstructing a URL
+ * from scratch (baseUrl + relativePath + queryParams), which is fragile —
+ * e.g. it silently drops the URL hash fragment (see computeRelativeLocation),
+ * so a site that uses "#addon"-style routing ends up on a URL that looks
+ * right but never renders the section the recording actually needed. The
+ * click step alone is sufficient: replaying it re-triggers the same
+ * history/hash change naturally, with none of that reconstruction risk.
+ *
+ * popstate specifically CAN also be fired by a genuine, deliberate press of
+ * the browser's own back/forward button — which has no preceding in-page
+ * click to correlate with, so it wouldn't fall inside this window anyway.
+ * The only way this suppression swallows a real navigation is a user
+ * coincidentally pressing browser-back within 2s of an unrelated in-page
+ * click — the same small, already-accepted risk pushState/replaceState
+ * suppression below has lived with.
  */
 const CLICK_NAV_SUPPRESS_MS = 2000;
 
 function handleNavigation(kind) {
   if (!state.isRecording) return;
-  
+
   // ── Suppress SPA navigations triggered by a recent click ──
-  // pushState / replaceState fired within CLICK_NAV_SUPPRESS_MS after the
-  // last recorded click are side-effects of that click (React Router,
-  // micro-frontend shell, etc.).  The click step is already recorded;
-  // adding a navigation step would cause a redundant full page reload
-  // during replay.
-  if (kind === 'pushState' || kind === 'replaceState') {
+  // Fired within CLICK_NAV_SUPPRESS_MS after the last recorded click, these
+  // are side-effects of that click (React Router, micro-frontend shell,
+  // etc.).  The click step is already recorded; adding a navigation step
+  // would cause a redundant (and, for popstate/hashchange, URL-reconstruction
+  // -fragile) replay action.
+  if (kind === 'pushState' || kind === 'replaceState' || kind === 'popstate' || kind === 'hashchange') {
     const timeSinceClick = Date.now() - (state.lastClickSentAt || 0);
     if (timeSinceClick < CLICK_NAV_SUPPRESS_MS) {
       console.log("[autotest][record] Suppressing", kind, "navigation —",
@@ -4840,14 +5076,16 @@ function handleNavigation(kind) {
       // instead of the page it was clicked from.
       const interactionStep = state.lastInteractionStep;
       if (interactionStep) {
-        const { relativePath, queryParams } = computeRelativeLocation(window.location.href, state.baseUrl);
+        const { relativePath, queryParams, hash } = computeRelativeLocation(window.location.href, state.baseUrl);
         interactionStep.relativePath = relativePath;
         interactionStep.queryParams = queryParams;
+        interactionStep.hash = hash;
         chrome.runtime.sendMessage({
           type: "patch_step_path",
           stepId: interactionStep.id,
           relativePath,
-          queryParams
+          queryParams,
+          hash
         }).catch(() => {});
       }
       return;
