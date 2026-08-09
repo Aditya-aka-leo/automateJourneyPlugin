@@ -3025,9 +3025,28 @@ function isTypeaheadInput(el) {
 async function typeCharByChar(el, text) {
   el.focus();
   if (el.value) {
-    el.setSelectionRange?.(0, el.value.length);
-    document.execCommand('selectAll', false);
-    document.execCommand('delete', false);
+    // Clear via the native value setter (bypasses React's tracked-value
+    // descriptor), same technique as the main non-typeahead input path
+    // below — NOT execCommand('selectAll')/('delete'), which is not
+    // reliable for fully clearing a React-controlled input. This matters
+    // most on a SECOND pass through the same typeahead field, once it
+    // already holds a previously-selected option's display text: an
+    // incomplete execCommand-based clear would leave stale characters
+    // behind, and the freshly-typed text would get inserted alongside
+    // them — producing a garbled search query that the live-search API
+    // has no match for (surfaced in the UI as "No data").
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value'
+    )?.set;
+    if (nativeInputValueSetter) {
+      nativeInputValueSetter.call(el, '');
+    } else {
+      el.value = '';
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    // Give the framework a tick to process the clear before typing begins,
+    // so the first typed character doesn't race the clear's own re-render.
+    await new Promise((r) => setTimeout(r, 50));
   }
   for (const char of String(text ?? "")) {
     const code = char.charCodeAt(0);
@@ -3848,6 +3867,27 @@ async function performStep(step) {
     // live search — a one-shot value assignment never fires it, so the
     // option list a later click step depends on would never render.
     if (isTypeaheadInput(el)) {
+      // If the field already shows exactly this value, there's nothing to
+      // type. This guards against a "change" step that was only ever the
+      // native side-effect of a PRECEDING key-driven selection (type →
+      // ArrowDown → Enter) settling, not a separate user action — common
+      // for widgets like AEM's guideDropDownList, where selecting a result
+      // via Enter fires a native 'change' with the now-resolved value.
+      // Retyping that same value character-by-character would reopen a
+      // brand-new live search for it, but with no follow-up
+      // ArrowDown/Enter/click step recorded to resolve THAT search, the
+      // field is left showing the right text with nothing actually
+      // committed underneath (the hidden <select> this widget maintains
+      // never gets set) — surfaced downstream as a "required field" error
+      // despite the visible value looking correct.
+      if (targetValue !== "" && String(el.value ?? "").trim() === String(targetValue).trim()) {
+        console.log("[autotest][replay] Typeahead already shows the target value — skipping retype to avoid reopening an unresolved search:", targetValue);
+        return {
+          ok: true,
+          meta: { usedSelector: used },
+          debug: { ...consumeDebugBuffer(), selectorAttempts }
+        };
+      }
       console.log("[autotest][replay] Typeahead input detected — typing char-by-char:", targetValue);
       await typeCharByChar(el, targetValue);
       const postIdle = await waitForPageIdle();
@@ -4502,11 +4542,24 @@ function resolveClickTarget(target) {
       if (el.getAttribute?.('tabindex') != null && el.onclick) return el;
       // Found a label wrapping a hidden input
       if (pTag === 'label') return el;
+      // Custom toggle/switch widgets (e.g. PrimeFaces-style "switchbutton")
+      // commonly lay out their visible thumb/handle and labels as SIBLINGS
+      // of the actual checkbox holding the real value, all under one
+      // wrapper div — rather than nesting the checkbox inside the visible
+      // part. Walking only ancestors (as this loop otherwise does) never
+      // finds a sibling, so a click squarely on the handle — the most
+      // natural place to click/tap to toggle it — resolves to nothing
+      // recordable. Check for a directly-owned toggle input at each
+      // ancestor level before giving up on it.
+      const siblingToggle = el.querySelector?.(
+        ':scope > input[type="checkbox"], :scope > input[type="radio"], :scope > [role="checkbox"], :scope > [role="radio"], :scope > [role="switch"]'
+      );
+      if (siblingToggle) return siblingToggle;
       el = el.parentElement;
       depth++;
     }
   }
-  
+
   return target;
 }
 
@@ -4878,6 +4931,25 @@ function handleClick(event) {
   const inputType = target.getAttribute?.('type')?.toLowerCase();
   const targetRole = target.getAttribute?.('role')?.toLowerCase();
   const isInputElement = (tagName === "input" || tagName === "textarea" || tagName === "select" || target.isContentEditable);
+
+  // Diagnostic: full visibility into what handleClick resolved to and why,
+  // for tracking down clicks that silently don't produce a step (e.g. a
+  // custom toggle/switch widget resolving to an unexpected ancestor).
+  console.log("[autotest][record][click-debug]", {
+    originalTag: event.target?.tagName?.toLowerCase(),
+    originalId: event.target?.id || null,
+    originalClass: typeof event.target?.className === "string" ? event.target.className.slice(0, 80) : null,
+    originalText: (event.target?.textContent || "").trim().slice(0, 40),
+    resolvedTag: tagName,
+    resolvedId: target?.id || null,
+    resolvedClass: typeof target?.className === "string" ? target.className.slice(0, 80) : null,
+    resolvedRole: targetRole || null,
+    resolvedText: (target?.textContent || "").trim().slice(0, 40),
+    isInputElement,
+    willBeMeaningless: !isInputElement && targetRole !== 'checkbox' && targetRole !== 'radio' && targetRole !== 'switch'
+      && !(tagName === 'input' && (inputType === 'radio' || inputType === 'checkbox'))
+      ? isMeaninglessClickTarget(target) : null
+  });
   
   // ── Native radio / checkbox: always record as CLICK immediately ──
   const isNativeCheckRadio = tagName === 'input' && (inputType === 'radio' || inputType === 'checkbox');
