@@ -36,7 +36,12 @@ const state = {
   inputDebounceTimer: null,
   lastClickTarget: null,
   lastClickTime: 0,
-  lastClickSentAt: 0 // Timestamp of last recorded click step (used to suppress SPA nav)
+  lastClickSentAt: 0, // Timestamp of last recorded click step (used to suppress SPA nav)
+  // Persistent (not time-windowed) per-field dedup: once a value has been
+  // recorded for a field, don't record it again unless it actually changes —
+  // even if the page re-fires input/change on that field much later (AEM
+  // commonly does this when cross-field rules re-evaluate a section).
+  lastRecordedFieldValue: new Map()
 };
 
 // ── Network interception state (block/mock/capture) ──────────────
@@ -83,11 +88,39 @@ const DEDUPE_WINDOW_MS = 350;
 const INPUT_DEBOUNCE_MS = 1000;
 const CLICK_TO_INPUT_WINDOW_MS = 500; // If input happens within 500ms of click, merge them
 const DEFAULT_WAIT = {
-  elementVisibleMs: 4000,
+  // How long to wait for a step's target element to appear/become visible
+  // before giving up on it. A slow-rendering popup (async data fetch,
+  // multi-hop panel animation, etc.) can legitimately take a while to put
+  // its fields on screen — this is deliberately generous (10 minutes) so we
+  // never guess wrong just because we didn't wait long enough. If the
+  // element still never appears within this window, performStep() reports
+  // ELEMENT_NOT_FOUND, which aborts the whole replay (see sw.js) rather than
+  // silently proceeding against a page that isn't ready.
+  elementVisibleMs: 600000,
   domStableMs: 500,        // Wait for 500ms of DOM stability
-  domStableTimeoutMs: 15000, // Increased from 4s to 15s for complex pages
+  domStableTimeoutMs: 5000,
   networkIdleMs: 600,
-  networkIdleTimeoutMs: 15000 // Increased from 10s to 15s for slow networks
+  networkIdleTimeoutMs: 5000,
+  // A visible loading overlay/popup-loader is an explicit, unambiguous "not
+  // ready" signal from the page, so it gets the same 10-minute patience as
+  // element-visibility above. Unlike before, exhausting this window is now a
+  // hard failure (see waitForPageIdle's caller in performStep) instead of a
+  // best-effort "warn and continue" — proceeding against a page that never
+  // finished loading risks silently interacting with the wrong state.
+  loadingIndicatorTimeoutMs: 600000,
+  // Used by waitForPageIdle. A one-time slow backend call (e.g. a prefill
+  // lookup) usually resolves within a few seconds; perpetual chatter (a
+  // countdown timer, a bouncing "scroll down" indicator) never goes quiet no
+  // matter how long we wait. Since this is best-effort either way, a moderate
+  // ceiling catches the former without paying the full cost of the latter on
+  // every single step.
+  pageIdleTimeoutMs: 6000,
+  // How long things must stay quiet before waitForPageIdle declares the page
+  // settled. This runs before every single step, so it's a guaranteed tax on
+  // every step's latency — kept short since it only needs to catch an
+  // immediate mutation/network burst, not a slow one (a slow one still gets
+  // caught because it keeps resetting the timer for as long as it runs).
+  pageIdleQuietMs: 250
 };
 
 // ── Console error capture for assertions ──
@@ -134,6 +167,24 @@ function consumeDebugBuffer() {
 
 function markNetworkActivity() {
   networkTracker.lastActivity = performance.now();
+}
+
+// Analytics/tracking/telemetry traffic that never truly stops (beacons, pixels,
+// heartbeats) shouldn't count toward "is the page busy" — otherwise
+// waitForNetworkIdle can never find a quiet moment on a page running Adobe
+// Analytics/Target/Launch (or GA, etc.), and ends up burning its full timeout
+// on every single check.
+const NETWORK_IDLE_IGNORE_PATTERNS = [
+  /google-analytics\.com/i, /googletagmanager\.com/i, /doubleclick\.net/i,
+  /facebook\.com\/tr/i, /demdex\.net/i, /omtrdc\.net/i, /adobedtm\.com/i,
+  /2o7\.net/i, /hotjar\.com/i, /clarity\.ms/i, /nr-data\.net/i, /newrelic\.com/i,
+  /sentry\.io/i, /segment\.(io|com)/i, /mixpanel\.com/i, /amplitude\.com/i,
+  /\/b\/ss\//i
+];
+
+function isBackgroundNoiseUrl(url) {
+  const u = String(url || "");
+  return NETWORK_IDLE_IGNORE_PATTERNS.some((re) => re.test(u));
 }
 
 function patchNetworkTracking() {
@@ -188,8 +239,11 @@ function patchNetworkTracking() {
         return Promise.resolve(new Response(body, { status: mock.status || 200, headers }));
       }
 
-      networkTracker.pending += 1;
-      markNetworkActivity();
+      const isNoise = isBackgroundNoiseUrl(reqUrl);
+      if (!isNoise) {
+        networkTracker.pending += 1;
+        markNetworkActivity();
+      }
       try {
         const response = await originalFetch(...args);
         if (!response.ok) {
@@ -230,8 +284,10 @@ function patchNetworkTracking() {
         });
         throw err;
       } finally {
-        networkTracker.pending = Math.max(0, networkTracker.pending - 1);
-        markNetworkActivity();
+        if (!isNoise) {
+          networkTracker.pending = Math.max(0, networkTracker.pending - 1);
+          markNetworkActivity();
+        }
       }
     };
   }
@@ -283,8 +339,11 @@ function patchNetworkTracking() {
       return;
     }
 
-    networkTracker.pending += 1;
-    markNetworkActivity();
+    const isNoise = isBackgroundNoiseUrl(xhrUrl);
+    if (!isNoise) {
+      networkTracker.pending += 1;
+      markNetworkActivity();
+    }
     this.addEventListener(
       "loadend",
       () => {
@@ -310,18 +369,27 @@ function patchNetworkTracking() {
             capturedAt: Date.now()
           });
         }
-        networkTracker.pending = Math.max(0, networkTracker.pending - 1);
-        markNetworkActivity();
+        if (!isNoise) {
+          networkTracker.pending = Math.max(0, networkTracker.pending - 1);
+          markNetworkActivity();
+        }
       },
       { once: true }
     );
     return originalSend.apply(this, args);
   };
 
-  // Track resource entries when available (best-effort).
+  // Track resource entries when available (best-effort). Only count types that
+  // actually reflect app data-loading (scripts, fetch/xhr) — images, CSS,
+  // fonts, and tracking pixels load continuously on most real pages and would
+  // otherwise make the page look "busy" forever.
   try {
+    const MEANINGFUL_INITIATOR_TYPES = new Set(["script", "fetch", "xmlhttprequest"]);
     const observer = new PerformanceObserver((list) => {
-      if (list.getEntries().length > 0) markNetworkActivity();
+      const hasMeaningfulActivity = list.getEntries().some((entry) =>
+        MEANINGFUL_INITIATOR_TYPES.has(entry.initiatorType) && !isBackgroundNoiseUrl(entry.name)
+      );
+      if (hasMeaningfulActivity) markNetworkActivity();
     });
     observer.observe({ entryTypes: ["resource"] });
   } catch {
@@ -330,12 +398,51 @@ function patchNetworkTracking() {
 }
 
 function nextFrame() {
-  return new Promise((resolve) => requestAnimationFrame(resolve));
+  // requestAnimationFrame alone can be throttled to a crawl — or suspended
+  // entirely — for a tab that isn't currently focused/visible. That's
+  // exactly where a cross-tab journey (e.g. an eKYC redirect opening in a
+  // new tab) can leave replay running, silently stalling every poll loop
+  // that uses this (waitForElementVisible, waitForPageIdle, etc.) with no
+  // logic bug at all — the browser just never calls the callback again.
+  // Race it against a plain timer so progress continues either way; rAF
+  // still wins (and keeps ticks aligned to paint) whenever the tab is
+  // actually visible.
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+    requestAnimationFrame(finish);
+    setTimeout(finish, 50);
+  });
+}
+
+function describeElementForLog(el) {
+  if (!el) return "null";
+  const id = el.id ? `#${el.id}` : "";
+  const cls = el.className && typeof el.className === "string"
+    ? `.${el.className.trim().split(/\s+/).slice(0, 3).join(".")}`
+    : "";
+  return `<${el.tagName?.toLowerCase()}${id}${cls}>`;
 }
 
 function isExtensionUiTarget(target) {
   if (!target || !target.closest) return false;
   return Boolean(target.closest('[data-autotest-extension="true"]'));
+}
+
+// AEM's WCM authoring/edit mode renders empty "Drag components here" drop
+// zones with these markers. They only exist in the author/edit-mode view of
+// a page — on the real published page a replay actually runs against, they
+// either don't render at all or stay hidden, so a step recorded against one
+// can never be found later, and polls forever. A click landing on one during
+// recording is always an accident (the author overlay sitting over/near the
+// real intended target), never a genuine interaction to replay.
+function isAemAuthoringPlaceholder(target) {
+  if (!target || !target.closest) return false;
+  return Boolean(target.closest('.cq-placeholder, .afEditorPlaceholder, [data-emptytext]'));
 }
 
 function dedupeKey({ type, selector, value, relativePath, queryParams }) {
@@ -345,6 +452,22 @@ function dedupeKey({ type, selector, value, relativePath, queryParams }) {
 }
 
 function isDuplicate(step) {
+  // Value-carrying steps (input/change) get a permanent per-field dedup keyed
+  // only on selector+value — NOT on step.type. Without this, a debounced
+  // "input" step and a later "change" step for the same field with the same
+  // (unchanged) value are treated as distinct events (dedupeKey includes
+  // type), producing the duplicate INPUT-then-CHANGE pairs seen in practice
+  // when AEM re-fires change on an already-filled field during a re-render.
+  if ((step.type === "input" || step.type === "change") && step.value !== undefined) {
+    const fieldKey = `${step.selector?.primary?.value || ""}::${step.relativePath || ""}`;
+    if (state.lastRecordedFieldValue.get(fieldKey) === step.value) return true;
+    state.lastRecordedFieldValue.set(fieldKey, step.value);
+    return false;
+  }
+
+  // Everything else (click, submit, navigation, asserts) uses the short
+  // time-windowed dedup — it only needs to guard against a genuine double
+  // fire of the same discrete event, not a delayed re-fire.
   const key = dedupeKey(step);
   const now = Date.now();
   state.recentEvents = state.recentEvents.filter((e) => now - e.time < DEDUPE_WINDOW_MS);
@@ -382,7 +505,14 @@ function computeRelativeLocation(urlString, baseUrlString) {
     queryParams[key].push(value);
   }
 
-  return { relativePath, queryParams };
+  // Some sites use the URL hash for routing/state (e.g. an "#addon" section
+  // that only renders once that fragment is present), not just in-page
+  // anchors. Dropping it here would silently replay against a URL that
+  // never loads that section, even though relativePath/queryParams both
+  // "match" — the fragment is the part that actually mattered.
+  const hash = url.hash || "";
+
+  return { relativePath, queryParams, hash };
 }
 
 function getVisibleText(el) {
@@ -399,25 +529,34 @@ function getVisibleText(el) {
  * This is used for text-based selectors and element names to ensure they
  * remain valid across replays when dynamic values change.
  */
-function getStableLabel(el) {
-  if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
-  
-  // Priority: aria-label > explicit label > first heading/strong text > cleaned full text
-  const ariaLabel = el.getAttribute('aria-label');
-  if (ariaLabel) return ariaLabel.trim();
-  
-  // Check for a heading or strong child with stable text
-  const headingOrStrong = el.querySelector('h1,h2,h3,h4,h5,h6,strong,b,.title,.heading,.name,.label');
-  if (headingOrStrong) {
-    const headText = (headingOrStrong.textContent || "").trim();
-    if (headText && headText.length <= 60) return headText;
+// Counts elements on the page whose own trimmed text matches `text`
+// (case-insensitive) — used to tell a genuinely identifying label apart
+// from generic boilerplate copy that's repeated across every instance of a
+// repeated component (e.g. a tooltip/benefit caption present on every card
+// in a list).
+function _countTextOccurrences(text) {
+  if (!text) return 0;
+  const wantedLower = text.trim().toLowerCase();
+  if (!wantedLower) return 0;
+  let count = 0;
+  const nodes = document.querySelectorAll(
+    "button, a, label, [role], [aria-label], span, div, h1, h2, h3, h4, h5, h6, strong, b"
+  );
+  for (const node of nodes) {
+    if (String(node.textContent || "").trim().toLowerCase() === wantedLower) count++;
   }
-  
-  const raw = String(el.textContent || "").trim();
-  if (!raw) return "";
-  
-  // Strip dynamic patterns: currency amounts, percentages, large numbers, dates
-  let cleaned = raw
+  return count;
+}
+
+// Strips currency amounts, percentages, large numbers, times, and dates from
+// text so the result stays stable across replays (a price/date/count that
+// happens to be correct at record time won't be at replay time). Shared by
+// every getStableLabel() candidate — including the heading/label-descendant
+// path, not just the final whole-element fallback — since a promotional
+// badge or tooltip can just as easily be JUST a raw price (e.g. "₹23,960")
+// as a whole card's assembled text can.
+function _stripDynamicText(raw) {
+  return String(raw || "")
     // Currency: ₹3,958+, $29.99, €100, £50.00, etc.
     .replace(/[₹$€£¥]\s*[\d,]+\.?\d*/g, '')
     // Standalone numbers with commas/decimals: 3,958, 1234.56
@@ -435,10 +574,82 @@ function getStableLabel(el) {
     // Collapse whitespace
     .replace(/\s+/g, ' ')
     .trim();
-  
+}
+
+function getStableLabel(el) {
+  if (!el || el.nodeType !== Node.ELEMENT_NODE) return "";
+
+  // Priority: aria-label > explicit label > first heading/strong text > cleaned full text
+  const ariaLabel = el.getAttribute('aria-label');
+  if (ariaLabel) return ariaLabel.trim();
+
+  // Above this, a candidate isn't "identifying" anymore. This has to be
+  // strict equality with 1, not just "a small number" — a short, generic
+  // word colliding with even ONE unrelated element elsewhere on the page is
+  // already a real bug, not just a repeated-component edge case: e.g. a
+  // fare-tier control labeled "Low" and a completely unrelated "Low"-labeled
+  // link to a fees-and-charges info page are two different elements that
+  // happen to share the same short text — resolveByText()'s exact-match
+  // phase deterministically picks whichever comes first in DOM order, which
+  // may well be the wrong one. Applied to every candidate path below, not
+  // just the heading/label one.
+  const MAX_ACCEPTABLE_LABEL_REPETITION = 1;
+
+  // Consider every heading/strong/.title/.heading/.name/.label descendant,
+  // not just the first one — a component can contain more than one (e.g. a
+  // generic tooltip/benefit caption that's identical on every sibling card,
+  // plus the element's own specific name further down). Blindly taking the
+  // first match can silently pick the generic, page-wide-repeated one,
+  // making every sibling's "stable label" collide with each other instead
+  // of identifying this specific element. Prefer whichever candidate's text
+  // is least repeated elsewhere on the page.
+  const labelCandidates = el.querySelectorAll('h1,h2,h3,h4,h5,h6,strong,b,.title,.heading,.name,.label');
+  if (labelCandidates.length > 0) {
+    let best = null;
+    let bestCount = Infinity;
+    for (const cand of labelCandidates) {
+      const headText = _stripDynamicText((cand.textContent || "").trim());
+      if (!headText || headText.length > 60) continue;
+      const count = _countTextOccurrences(headText);
+      if (count > 0 && count < bestCount) {
+        best = headText;
+        bestCount = count;
+        if (bestCount <= 1) break; // can't do better than unique
+      }
+    }
+    if (best && bestCount <= MAX_ACCEPTABLE_LABEL_REPETITION) return best;
+  }
+
+  const raw = String(el.textContent || "").trim();
+  if (!raw) return "";
+
+  const cleaned = _stripDynamicText(raw);
+
   if (!cleaned) return "";
-  // Keep it short
-  return cleaned.length > 60 ? cleaned.slice(0, 57) + "..." : cleaned;
+  // Reject (rather than truncate) text past this length. This value is used
+  // as a match target by resolveByText(), whose fuzzy phase matches via
+  // substring containment — and a long, multi-field blob like a whole
+  // card's concatenated text is very likely to ALSO be a substring of one
+  // of el's own ancestors (which trivially contain all their descendants'
+  // text plus more), so instead of identifying this specific element it
+  // can resolve to some much larger wrapping container. Truncating with a
+  // "..." marker doesn't fix this either — that marker never appears in
+  // real DOM text at the exact cut point, so it would just fail to match
+  // anything at all. Only text short enough to plausibly belong to one
+  // specific element (a button/link label, not an assembled card) is
+  // trustworthy here; return no candidate at all otherwise so
+  // generateSelector falls back to a structural selector (CSS/XPath)
+  // instead of a misleading text one.
+  if (cleaned.length > 60) return "";
+
+  // Same repetition guard as the heading/label path above, applied here too
+  // — a short, generic whole-element text (e.g. a lone sort-toggle word
+  // like "Low") is just as capable of colliding with unrelated content
+  // elsewhere on the page as a repeated tooltip caption is.
+  const occurrences = _countTextOccurrences(cleaned);
+  if (occurrences > MAX_ACCEPTABLE_LABEL_REPETITION) return "";
+
+  return cleaned;
 }
 
 function cssEscape(value) {
@@ -470,6 +681,106 @@ function buildXPath(el) {
   return `/${segments.join("/")}`;
 }
 
+// Checks whether a CSS selector resolves to exactly one element matching
+// `el`, right now. Counts only VISIBLE matches when el itself is visible —
+// AEM (and other frameworks) commonly leave hidden template/clone markup
+// around with identical attributes to the real, interactable element, which
+// would otherwise make an actually-unique-for-the-user's-purposes selector
+// look ambiguous by a raw querySelectorAll().length check.
+function isUniqueMatchFor(el, cssValue) {
+  let matches;
+  try {
+    matches = document.querySelectorAll(cssValue);
+  } catch {
+    return false;
+  }
+  if (matches.length === 0) return false;
+  if (isElementVisible(el)) {
+    const visibleMatches = Array.from(matches).filter(isElementVisible);
+    if (visibleMatches.length > 0) {
+      return visibleMatches.length === 1 && visibleMatches[0] === el;
+    }
+  }
+  return matches.length === 1 && matches[0] === el;
+}
+
+// UI frameworks (Angular Material/CDK, MUI, Radix, Chakra, React 18 useId(),
+// Ember, react-select, etc.) assign ids from an incrementing counter tied to
+// component MOUNT ORDER, not to the element's identity — e.g.
+// "mat-mdc-checkbox-0-input". That index can land on a completely different
+// element next run if anything upstream renders in a different order (async
+// data, conditional branches, lazy-loaded modules). It's still unique *right
+// now*, so treating it as a top-priority "stable id" selector works during
+// recording and then silently points at the wrong element (or nothing) later.
+// Walks up from el looking for the nearest ancestor with a stable identity
+// (a non-framework id or a data-testid-style attribute) to anchor a
+// structural selector to, so it can't collide with the same structure
+// repeated elsewhere on the page (e.g. a list of cards that each contain
+// their own copy of the element being targeted).
+function findStableAncestorSelector(el, maxDepth) {
+  let node = el.parentElement;
+  for (let i = 0; i < maxDepth && node; i++) {
+    if (node.id && !isLikelyUnstableFrameworkId(node.id)) {
+      return `#${cssEscape(node.id)}`;
+    }
+    for (const attr of ["data-testid", "data-test", "data-test-id"]) {
+      const val = node.getAttribute(attr);
+      if (val) return `[${attr}="${escapeAttributeValue(val)}"]`;
+    }
+    node = node.parentElement;
+  }
+  return null;
+}
+
+function isLikelyUnstableFrameworkId(id) {
+  // Matches both older Angular Material ids (mat-input-0, mat-checkbox-3)
+  // and newer MDC-based ones (mat-mdc-checkbox-0-input) — "mat-" alone
+  // covers both, since the latter is just "mat-" + "mdc-...".
+  // "ui-id-" is jQuery UI's widget factory (autocomplete/tabs/accordion/etc.)
+  // — it assigns ui-id-N from a single counter shared across every jQuery UI
+  // widget instantiated on the page, so N depends on page load order/timing
+  // and is not reproducible across sessions, even though it looks unique
+  // (and stable) within any one snapshot of the DOM.
+  if (/^(mat-|cdk-|mdc-|mui-|radix-|chakra-|headlessui-|ember\d*-|react-select-|ui-id-)[\w-]*\d+/i.test(id)) return true;
+  if (/^:r[0-9a-z]+:$/i.test(id)) return true; // React 18 useId()
+
+  // Generic backstop for frameworks/CMSes not covered by the known-prefix
+  // list above — e.g. AEM/site-specific ids like "dynamicpage-30d734ff40".
+  // A trailing run of hex-only characters this long is very unlikely to
+  // appear in a hand-authored id; it's almost always an opaque per-render
+  // or per-session hash, which carries the exact same risk as a known
+  // framework's auto-generated id (unique right now, not guaranteed to
+  // reproduce next time).
+  if (/-[0-9a-f]{6,}$/i.test(id)) return true;
+
+  return false;
+}
+
+// Detects class names that encode a transient UI STATE rather than the
+// element's identity — e.g. react-date-range's "rdrDayHovered", applied to
+// a calendar day only while the mouse is actively over it. It happened to
+// be present (and even "unique") at record time purely because the
+// recorder's cursor was on that cell, not because it identifies the cell;
+// trusting it bakes in a class that won't exist at replay time. The
+// original exact-match check (class === "hover") missed compound names like
+// this because they're a whole word glued onto a prefix, not the whole
+// class string — so this splits camelCase/kebab-case/snake_case into words
+// and checks the LAST one, which is where a library's state suffix lives
+// (contrast with a BEM-style class like "selected-fare", where "selected"
+// is a leading modifier describing the component's fixed purpose, not a
+// toggled state — the check deliberately only looks at the last word so it
+// doesn't misfire on names like that).
+function _isEphemeralStateClass(cls) {
+  const words = String(cls || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((w) => w.toLowerCase());
+  if (words.length === 0) return false;
+  const lastWord = words[words.length - 1];
+  return /^(hover|hovered|active|selected|focus|focused|disabled|error|highlighted|current)$/.test(lastWord);
+}
+
 function generateSelector(el) {
   if (!el || el.nodeType !== Node.ELEMENT_NODE) {
     return { primary: null, fallbacks: [] };
@@ -477,9 +788,12 @@ function generateSelector(el) {
 
   const candidates = [];
   const tag = el.tagName.toLowerCase();
+  const idIsUnstable = el.id && isLikelyUnstableFrameworkId(el.id);
 
-  // 1) Stable id
-  if (el.id) {
+  // 1) Stable id — skip framework auto-generated ids here; they're pushed
+  // further down (after aria-label/name/text) as a lower-priority fallback
+  // instead, since they still often work but shouldn't be trusted first.
+  if (el.id && !idIsUnstable) {
     candidates.push({
       type: "css",
       value: `#${cssEscape(el.id)}`,
@@ -597,8 +911,8 @@ function generateSelector(el) {
   }
   
   // Class-based selector (if classes exist and are reasonable)
-  const classes = Array.from(el.classList).filter(c => 
-    c && !c.match(/^(active|selected|hover|focus|disabled|error)$/i) && c.length < 50
+  const classes = Array.from(el.classList).filter(c =>
+    c && !_isEphemeralStateClass(c) && c.length < 50
   );
   if (classes.length > 0 && classes.length <= 3) {
     candidates.push({
@@ -610,20 +924,39 @@ function generateSelector(el) {
 
   // 3.7) Structural selector: nth-of-type for role-based siblings
   // When multiple elements share the same role (e.g. fare radio buttons),
-  // use nth-of-type to distinguish them stably (independent of text content)
+  // use nth-of-type to distinguish them stably (independent of text content).
   if (role) {
     const parent = el.parentElement;
     if (parent) {
-      const siblings = Array.from(parent.querySelectorAll(`:scope > ${tag}[role="${escapeAttributeValue(role)}"]`));
-      if (siblings.length > 1) {
-        const idx = siblings.indexOf(el);
-        if (idx >= 0) {
-          candidates.push({
-            type: "css",
-            value: `${tag}[role="${escapeAttributeValue(role)}"]:nth-of-type(${idx + 1})`,
-            reason: `Structural position among ${siblings.length} sibling ${role} elements.`
-          });
-        }
+      // :nth-of-type counts siblings by TAG NAME ONLY, ignoring the rest of
+      // the compound selector (including [role=...]) — the index has to be
+      // computed the same way, or the generated selector can land on the
+      // wrong sibling (or match nothing) whenever a differently-roled
+      // element of the same tag sits between the role-matching ones.
+      const tagSiblings = Array.from(parent.children).filter(c => c.tagName === el.tagName);
+      const idx = tagSiblings.indexOf(el);
+      const roleSiblingCount = tagSiblings.filter(s => s.getAttribute("role") === role).length;
+      if (idx >= 0 && roleSiblingCount > 1) {
+        const structuralSelector = `${tag}[role="${escapeAttributeValue(role)}"]:nth-of-type(${idx + 1})`;
+        // Unscoped, this is dangerous on pages with repeated components —
+        // e.g. a list of flight cards that each render their own pair of
+        // fare radios. CSS resolves :nth-of-type per immediate parent, so
+        // the same selector string independently matches the Nth radio in
+        // EVERY card, not just this one: a selector that looked unique at
+        // record time (only one card rendered/visible then) silently
+        // becomes ambiguous once the full list is on the page at replay
+        // time. Anchor it to the nearest ancestor with a stable identity
+        // when one exists; otherwise keep it as a low-priority fallback so
+        // a more reliable candidate (text label, XPath) is tried first.
+        const ancestorScope = findStableAncestorSelector(el, 6);
+        candidates.push({
+          type: "css",
+          value: ancestorScope ? `${ancestorScope} ${structuralSelector}` : structuralSelector,
+          reason: ancestorScope
+            ? `Structural position among sibling ${role} elements, scoped to a stable ancestor.`
+            : `Structural position among sibling ${role} elements — unscoped, so ranked low-priority since it can collide with the same structure elsewhere on the page.`,
+          lowPriority: !ancestorScope
+        });
       }
     }
   }
@@ -638,6 +971,19 @@ function generateSelector(el) {
     });
   }
 
+  // 4b) Framework auto-generated id — kept as a low-confidence fallback
+  // below aria-label/name/text. It resolves uniquely more often than not
+  // (the mount-order index is frequently stable in practice), so it's still
+  // worth trying, just not trusted as the primary selector.
+  if (idIsUnstable) {
+    candidates.push({
+      type: "css",
+      value: `#${cssEscape(el.id)}`,
+      reason: "Framework auto-generated id (e.g. Angular Material/CDK) — kept as a low-priority fallback since its index can shift between sessions.",
+      lowPriority: true
+    });
+  }
+
   // 5) XPath fallback
   const xpath = buildXPath(el);
   if (xpath) {
@@ -648,8 +994,37 @@ function generateSelector(el) {
     });
   }
 
-  const [primary, ...fallbacks] = candidates;
-  
+  // Prefer candidates that uniquely resolve to THIS element right now. A
+  // selector like [aria-labelledby="..."] can be shared by several sibling
+  // fields (e.g. a composite day/month/year date input where all three
+  // sub-inputs point at the same shared error-description id) — without this
+  // check, that non-unique selector can still end up as primary just because
+  // it was pushed earlier, and querySelector will always resolve it to
+  // whichever sibling comes first in DOM order, silently misdirecting every
+  // step meant for the other siblings (e.g. month/year steps landing on day).
+  //
+  // Candidates flagged `lowPriority` (e.g. framework auto-generated ids like
+  // Angular Material's "mat-option-12") are deliberately excluded from the
+  // "unique right now" fast track even when they do resolve uniquely at
+  // record time — that's exactly the trap: they're unique *this instant*
+  // but the underlying index is tied to component mount order, so it can
+  // resolve to nothing (or a different sibling) as soon as anything upstream
+  // re-renders. A stable text/aria-label match is worth trying first even
+  // though it's not a "css" selector, so it's ranked ahead of lowPriority
+  // css candidates instead of always sinking below every css candidate.
+  const uniqueCss = [];
+  const lowPriorityCss = [];
+  const nonUniqueCss = [];
+  const nonCss = [];
+  for (const c of candidates) {
+    if (c.type !== "css") { nonCss.push(c); continue; }
+    if (c.lowPriority) { lowPriorityCss.push(c); continue; }
+    (isUniqueMatchFor(el, c.value) ? uniqueCss : nonUniqueCss).push(c);
+  }
+  const orderedCandidates = [...uniqueCss, ...nonCss, ...lowPriorityCss, ...nonUniqueCss];
+
+  const [primary, ...fallbacks] = orderedCandidates;
+
   return { primary: primary || null, fallbacks };
 }
 
@@ -1542,12 +1917,32 @@ async function findElementWithRefinement(step, selector, maxRetries = 3, customT
   return initialResult;
 }
 
+// Deliberately does NOT check opacity. Many UI libraries (Angular Material's
+// MDC checkboxes/radios/switches, MUI, and plenty of custom widgets) render
+// the real native <input> transparent (opacity: 0) and layered on top of a
+// decorative sibling that shows the visible checkmark/box — the input is
+// still exactly where the user clicks and still toggles on click, it's just
+// visually see-through. Treating opacity 0 as "not visible" made replay wait
+// out the full 10-minute elementVisibleMs timeout on every such control
+// (see waitForElementVisible) since it never becomes non-transparent.
 function isElementVisible(el) {
   if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
   const style = window.getComputedStyle(el);
   if (style.visibility === "hidden" || style.display === "none") return false;
   const rect = el.getBoundingClientRect();
   return rect.width > 0 && rect.height > 0;
+}
+
+// Finds the nearest visible, clickable ancestor of a hidden element — used
+// to try "opening" a collapsed field wrapper whose inner control (e.g. an
+// airport-search combobox) only renders visibly once the wrapper itself is
+// clicked. Starts the search from hiddenEl itself via closest(), so it
+// naturally returns the FIRST matching ancestor, not just any one.
+function findRevealableAncestor(hiddenEl) {
+  if (!hiddenEl) return null;
+  const clickable = hiddenEl.closest?.('button, a, [role="button"], [onclick]');
+  if (clickable && clickable !== hiddenEl && isElementVisible(clickable)) return clickable;
+  return null;
 }
 
 /**
@@ -1886,110 +2281,160 @@ async function waitForElementVisible(selector, { timeoutMs = DEFAULT_WAIT.elemen
   }
   if (looseFallbacks.length) candidates.push(...looseFallbacks);
 
-  const selectorAttempts = [];
-  
-  
+  // Validate CSS candidates once up front, not on every poll tick.
+  const validCandidates = candidates.filter((candidate) => {
+    if (candidate?.type !== "css") return true;
+    try {
+      document.querySelectorAll(candidate.value);
+      return true;
+    } catch (err) {
+      console.warn(`[autotest][replay] ✗ Invalid CSS selector, skipping:`, candidate.value, err.message);
+      return false;
+    }
+  });
+
   console.log("[autotest][replay] Trying selectors:", {
-    total: candidates.length,
+    total: validCandidates.length,
     primary: selector.primary?.value || selector.primary?.type,
     fallbackCount: selector.fallbacks?.length || 0
   });
-  
-  // Give each candidate a reduced timeout so all can be tried
-  // Primary gets more time, fallbacks get less
-  const primaryTimeoutMs = Math.min(timeoutMs, 3000);
-  const fallbackTimeoutMs = 1000;
-  
-  for (let candidateIdx = 0; candidateIdx < candidates.length; candidateIdx++) {
-    const candidate = candidates[candidateIdx];
-    const candidateTimeout = candidateIdx === 0 ? primaryTimeoutMs : fallbackTimeoutMs;
-    let attempted = false;
-    let lastFoundElement = null;
-    let invalidSelector = false;
-    
-    console.log(`[autotest][replay] Attempt ${candidateIdx + 1}/${candidates.length}:`, {
-      type: candidate?.type,
-      value: candidate?.value?.substring?.(0, 100),
-      reason: candidate?.reason,
-      timeoutMs: candidateTimeout
-    });
-    
-    // Try to validate CSS selector before polling
-    if (candidate?.type === "css") {
-      try {
-        document.querySelectorAll(candidate.value);
-      } catch (err) {
-        console.warn(`[autotest][replay] ✗ Invalid CSS selector, skipping:`, candidate.value, err.message);
-        invalidSelector = true;
-        selectorAttempts.push({
-          candidate,
-          found: false,
-          visible: false,
-          timestamp: Date.now(),
-          error: "Invalid CSS selector"
-        });
-      }
-    }
-    
-    // Skip this candidate if it's invalid
-    if (invalidSelector) continue;
-    
-    const candidateStart = performance.now();
-    while (performance.now() - candidateStart < candidateTimeout) {
+
+  // Check every candidate on every poll tick (instead of exhausting the
+  // primary candidate's own timeout before even trying a fallback). If the
+  // primary selector never matches, a working fallback still resolves within
+  // one poll interval instead of after several seconds of wasted waiting.
+  const selectorAttempts = [];
+  let bestHidden = null; // first found-but-not-yet-visible match, kept as a fallback result
+  let hiddenSince = null; // when bestHidden was first observed, for the reveal-ancestor grace period below
+  let revealAttempted = false; // try the ancestor-click reveal at most once per call
+
+  const start = performance.now();
+  let lastHeartbeat = start;
+  while (performance.now() - start < timeoutMs) {
+    let firstVisible = null; // first visible match, in candidate priority order — used if none are unique
+    // Lowest priority: unique right now, but via a framework auto-generated id
+    // (e.g. jQuery UI autocomplete's #ui-id-N). These are assigned from a
+    // counter shared across every such widget on the page, so the number is
+    // tied to page load order/timing, not to any specific option — it can
+    // (and does) point at a completely different element in a later session,
+    // even though it resolves to exactly one real element right now. This
+    // matters most for OLD recordings made before this candidate ordering
+    // existed, where the unstable id may still be stored as primary — this
+    // check demotes it at replay time too, so a better fallback (typically a
+    // text match on the option's actual visible label) gets tried first
+    // without needing to re-record.
+    let unstableIdMatch = null;
+    for (const candidate of validCandidates) {
       const el = resolveBySelectorCandidate(candidate);
-      if (el) {
-        lastFoundElement = el;
-        if (isElementVisible(el)) {
-          console.log(`[autotest][replay] ✓ Selector matched (visible):`, {
-            candidateIdx,
+      if (!el) continue;
+      if (isElementVisible(el)) {
+        // A recorded selector can be shared by several sibling elements (e.g.
+        // a composite date field where day/month/year all point at the same
+        // aria-labelledby). If this candidate resolves to exactly one element
+        // right now, trust it immediately — don't let an earlier, ambiguous
+        // candidate (which also happens to be visible) win just because it's
+        // first in priority order.
+        // Use the same visibility-aware uniqueness check as generateSelector —
+        // a raw querySelectorAll().length count would wrongly reject a
+        // genuinely-unique-for-the-user's-purposes selector whenever AEM (or
+        // similar frameworks) leave a hidden template/clone element around
+        // with identical attributes, sending resolution all the way down to
+        // the brittle XPath fallback for no real reason.
+        const isUnique = candidate.type !== "css" || isUniqueMatchFor(el, candidate.value);
+        const idMatch = candidate.type === "css" ? /^#([\w-]+)$/.exec(candidate.value) : null;
+        const isUnstableId = !!idMatch && isLikelyUnstableFrameworkId(idMatch[1]);
+        if (isUnique && !isUnstableId) {
+          console.log(`[autotest][replay] ✓ Selector matched (visible, unique):`, {
             type: candidate?.type,
             value: candidate?.value?.substring?.(0, 100)
           });
-          selectorAttempts.push({
-            candidate,
-            found: true,
-            visible: true,
-            timestamp: Date.now()
-          });
+          selectorAttempts.push({ candidate, found: true, visible: true, timestamp: Date.now() });
           return { el, used: candidate, selectorAttempts, visible: true };
         }
+        if (isUnique && isUnstableId) {
+          if (!unstableIdMatch) unstableIdMatch = { el, candidate };
+          continue; // keep looking for something more trustworthy this tick
+        }
+        if (!firstVisible) firstVisible = { el, candidate };
+      } else if (!bestHidden) {
+        bestHidden = { el, candidate };
+        hiddenSince = performance.now();
       }
-      attempted = true;
-      await nextFrame();
     }
-    
-    // After timeout: if we found an element but it never became visible,
-    // return it anyway (some interactions work on hidden elements)
-    if (lastFoundElement) {
-      console.log(`[autotest][replay] ⚠ Selector matched (hidden):`, {
-        candidateIdx,
-        type: candidate?.type,
-        value: candidate?.value?.substring?.(0, 100)
+    // No trustworthy candidate uniquely matched this tick — fall back to the
+    // first ambiguous-but-visible match in priority order, and only then to
+    // an unstable-id match (better than nothing, but least trusted).
+    if (firstVisible) {
+      console.log(`[autotest][replay] ✓ Selector matched (visible, ambiguous — no unique candidate available):`, {
+        type: firstVisible.candidate?.type,
+        value: firstVisible.candidate?.value?.substring?.(0, 100)
       });
-      selectorAttempts.push({
-        candidate,
-        found: true,
-        visible: false,
-        timestamp: Date.now()
-      });
-      return { el: lastFoundElement, used: candidate, selectorAttempts, visible: false };
+      selectorAttempts.push({ candidate: firstVisible.candidate, found: true, visible: true, timestamp: Date.now() });
+      return { el: firstVisible.el, used: firstVisible.candidate, selectorAttempts, visible: true };
     }
-    
-    if (attempted) {
-      console.log(`[autotest][replay] ✗ Selector failed:`, {
-        candidateIdx,
-        type: candidate?.type,
-        value: candidate?.value?.substring?.(0, 100)
+    if (unstableIdMatch) {
+      console.warn(`[autotest][replay] ⚠ Selector matched (visible, unique) but only via a framework auto-generated id — using as last resort:`, {
+        type: unstableIdMatch.candidate?.type,
+        value: unstableIdMatch.candidate?.value?.substring?.(0, 100)
       });
-      selectorAttempts.push({
-        candidate,
-        found: false,
-        visible: false,
-        timestamp: Date.now()
+      selectorAttempts.push({ candidate: unstableIdMatch.candidate, found: true, visible: true, timestamp: Date.now() });
+      return { el: unstableIdMatch.el, used: unstableIdMatch.candidate, selectorAttempts, visible: true };
+    }
+
+    // Nothing matched this tick — surface what we're still waiting on every
+    // few seconds so a stuck step is diagnosable from the live console
+    // instead of only after the full timeout elapses.
+    const nowHb = performance.now();
+    if (nowHb - lastHeartbeat > 3000) {
+      lastHeartbeat = nowHb;
+      console.log(`[autotest][replay] ⏳ Still looking for element after ${Math.round((nowHb - start) / 1000)}s`, {
+        primary: selector.primary?.value?.substring?.(0, 100) || selector.primary?.type,
+        candidatesTried: validCandidates.map((c) => `${c.type}:${String(c.value ?? "").substring(0, 60)}`),
+        bestHiddenMatch: bestHidden
+          ? { selector: `${bestHidden.candidate?.type}:${String(bestHidden.candidate?.value ?? "").substring(0, 60)}`, el: describeElementForLog(bestHidden.el) }
+          : null
       });
     }
+
+    // A resolvable-but-permanently-hidden target usually means the recorded
+    // step skipped an intermediate "open this" click — e.g. a collapsed
+    // field wrapper whose inner input/combobox doesn't exist visibly until
+    // the wrapper itself is clicked (this can happen if that wrapper was
+    // already open at record time, so only the inner control's click got
+    // captured). Without this, such a step would wait out the ENTIRE
+    // timeout with literally no way to ever succeed, since nothing is
+    // driving the wrapper open. Try clicking the nearest visible clickable
+    // ancestor once, after a short grace period (so we don't preempt a
+    // panel that's just mid-animation), and let the normal polling above
+    // pick up the target once it becomes visible.
+    if (bestHidden && !revealAttempted && hiddenSince != null && nowHb - hiddenSince > 2000) {
+      revealAttempted = true;
+      const ancestor = findRevealableAncestor(bestHidden.el);
+      if (ancestor) {
+        console.log("[autotest][replay] Target matched but stayed hidden — attempting to reveal via ancestor click:", describeElementForLog(ancestor));
+        try {
+          dispatchRealClick(ancestor);
+        } catch (_) {}
+      }
+    }
+
+    await nextFrame();
   }
-  
+
+  // Nothing became visible within the timeout — if something matched but
+  // stayed hidden, return it anyway (some interactions work on hidden elements).
+  if (bestHidden) {
+    console.log(`[autotest][replay] ⚠ Selector matched (hidden):`, {
+      type: bestHidden.candidate?.type,
+      value: bestHidden.candidate?.value?.substring?.(0, 100)
+    });
+    selectorAttempts.push({ candidate: bestHidden.candidate, found: true, visible: false, timestamp: Date.now() });
+    return { el: bestHidden.el, used: bestHidden.candidate, selectorAttempts, visible: false };
+  }
+
+  for (const candidate of validCandidates) {
+    selectorAttempts.push({ candidate, found: false, visible: false, timestamp: Date.now() });
+  }
   console.log("[autotest][replay] All selectors exhausted. No element found.");
   return { el: null, used: null, selectorAttempts, visible: false };
 }
@@ -2005,7 +2450,7 @@ async function waitForDOMStable({
   stableMs = DEFAULT_WAIT.domStableMs,
   timeoutMs = DEFAULT_WAIT.domStableTimeoutMs
 } = {}) {
-  let lastMutation = performance.now() - stableMs; // treat as already stable until a mutation fires
+  let lastMutation = performance.now(); // must observe a real quiet period before declaring stable
   const observer = new MutationObserver(() => {
     lastMutation = performance.now();
   });
@@ -2045,6 +2490,257 @@ async function waitForNetworkIdle({
     await nextFrame();
   }
   return { ok: false, error: "Network did not become idle within timeout." };
+}
+
+// Generic patterns for app-rendered loading overlays/spinners. A spinner is
+// often just a static SVG/icon with a CSS animation — once inserted it stops
+// triggering DOM mutations, so waitForDOMStable alone can't detect it. This
+// catches the case where a loader appears *after* the page already looked
+// quiet (e.g. a delayed data fetch that re-renders the form a few seconds
+// after initial load).
+const LOADING_INDICATOR_SELECTORS = [
+  '[aria-busy="true"]',
+  '[role="progressbar"]',
+  '[class*="spinner" i]',
+  '[class*="loader" i]',
+  '[class*="loading" i]',
+  '[class*="blockui" i]',
+  '[class*="busy" i]'
+];
+
+// "overlay"/"backdrop" class names are ambiguous: they match real blocking
+// loaders (a custom "loading-overlay" div) but also the dimming layer that
+// legitimate modals/dialogs render behind themselves — jQuery UI's
+// .ui-widget-overlay, Bootstrap's .modal-backdrop, etc. When a dialog is
+// genuinely open, that backdrop staying visible for as long as the user is
+// filling in fields inside it is expected, not a "still loading" signal.
+// These patterns are only trusted when getOpenDialog() finds no open dialog
+// (see findVisibleLoadingIndicator) — unlike a "loaderPanel"-style false
+// positive, a real backdrop has no form content of its own to filter on.
+const OVERLAY_INDICATOR_SELECTORS = [
+  '[class*="overlay" i]',
+  '[class*="backdrop" i]'
+];
+
+// Name-agnostic backstop: a large, high-z-index, fixed/absolute element
+// covering most of the viewport is very likely a blocking overlay regardless
+// of what it's actually called — e.g. jQuery's blockUI plugin (common on
+// older AEM/jQuery forms) names its overlay ".blockOverlay"/".blockMsg",
+// which none of the class-name patterns above account for. Requiring large
+// coverage + high z-index keeps this from matching normal fixed headers,
+// cookie banners, etc.
+function isLikelyBlockingOverlay(el) {
+  if (!el || !isElementVisible(el)) return false;
+  // AEM's author-mode editing placeholders ("drag components here" drop
+  // targets, e.g. .cq-placeholder/.afEditorPlaceholder) stay in the DOM even
+  // on published pages. They're normally-empty structural scaffolding, not a
+  // loading state — but one can inherit the same fixed/full-coverage/
+  // high-z-index styling as a real popup sitting next to it (no interactive
+  // content to otherwise exclude it), which made it look like a permanently
+  // stuck "loading overlay" that would never actually clear.
+  if (el.classList.contains('cq-placeholder') || el.classList.contains('afEditorPlaceholder')) return false;
+  const style = window.getComputedStyle(el);
+  if (style.position !== "fixed" && style.position !== "absolute") return false;
+  const rect = el.getBoundingClientRect();
+  const viewportArea = window.innerWidth * window.innerHeight;
+  if (viewportArea <= 0) return false;
+  const coverage = (rect.width * rect.height) / viewportArea;
+  if (coverage < 0.6) return false;
+  const zIndex = parseInt(style.zIndex, 10);
+  if (Number.isNaN(zIndex) || zIndex < 100) return false;
+  if (containsInteractiveFormContent(el)) return false;
+  return true;
+}
+
+// A genuine loading spinner/overlay is decorative — it never contains actual
+// form controls the user needs to interact with. Some apps' popup/panel
+// containers happen to carry a "loader"/"loading"/"overlay"-named class for
+// unrelated reasons (transition/animation styling, legacy naming, etc.) —
+// e.g. an AEM Forms guide popup panel named "...FormPopupPanel loaderPanel"
+// that holds real input fields and a submit button. Class-name matching alone
+// can't tell these apart, but content can: if the "loader" candidate contains
+// real interactive controls, it's a content panel, not a blocking loader.
+function containsInteractiveFormContent(el) {
+  try {
+    return !!el.querySelector('input, textarea, select, button, a[href]');
+  } catch (_) {
+    return false;
+  }
+}
+
+// A <video> player's own seek/scrubber bar carries role="progressbar" for
+// accessibility (e.g. a promo video embedded in a marketing carousel), but
+// it has nothing to do with page-loading state. While the video is paused
+// or hasn't started, it sits at aria-valuenow="0" indefinitely — visible,
+// unchanging, and matching [role="progressbar"] forever — which would make
+// waitForNoLoadingIndicator block on it for the entire timeout on a page
+// that actually finished loading long ago. Video player widgets are shallow,
+// self-contained components, so a bounded ancestor walk reliably finds the
+// <video> element the bar controls without scanning the whole page.
+function isVideoScrubber(el) {
+  let node = el;
+  for (let i = 0; i < 6 && node; i++) {
+    if (node.querySelector && node.querySelector('video')) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
+function findVisibleLoadingIndicator() {
+  for (const sel of LOADING_INDICATOR_SELECTORS) {
+    let els;
+    try {
+      els = document.querySelectorAll(sel);
+    } catch (_) {
+      continue; // Some browsers may not support the "i" case-insensitive flag.
+    }
+    for (const el of els) {
+      if (isExtensionUiTarget(el)) continue; // Ignore our own HUD/panel.
+      if (!isElementVisible(el)) continue;
+      if (containsInteractiveFormContent(el)) continue;
+      if (isVideoScrubber(el)) continue;
+      return el;
+    }
+  }
+
+  // A genuinely open dialog/modal explains any overlay/backdrop-shaped
+  // element on the page — it's the dialog's own dimming layer, not a
+  // blocking loader. Treating it as one here would make every step
+  // targeting fields inside the dialog wait out the full timeout for as
+  // long as the dialog stays open, since the backdrop never disappears
+  // until the dialog itself closes.
+  if (getOpenDialog()) return null;
+
+  for (const sel of OVERLAY_INDICATOR_SELECTORS) {
+    let els;
+    try {
+      els = document.querySelectorAll(sel);
+    } catch (_) {
+      continue;
+    }
+    for (const el of els) {
+      if (isExtensionUiTarget(el)) continue;
+      if (!isElementVisible(el)) continue;
+      if (containsInteractiveFormContent(el)) continue;
+      // "overlay"/"backdrop" class names also show up on small decorative
+      // elements with no relation to page-blocking state — e.g. a masked-value
+      // span like class="mask-overlay" showing "*****1234" next to a PAN/
+      // account field. A genuine blocking overlay covers a meaningful part of
+      // the viewport, so require that before trusting the name match, same as
+      // the name-agnostic backstop below.
+      const rect = el.getBoundingClientRect();
+      const viewportArea = window.innerWidth * window.innerHeight;
+      const coverage = viewportArea > 0 ? (rect.width * rect.height) / viewportArea : 0;
+      if (coverage < 0.15) continue;
+      return el;
+    }
+  }
+
+  // Fall back to the name-agnostic overlay heuristic, checked over a bounded
+  // set of candidates (elements with a non-static position, which is most of
+  // what modals/overlays/loaders use) rather than every element on the page.
+  try {
+    const candidates = document.querySelectorAll('div, section, aside');
+    for (const el of candidates) {
+      if (isExtensionUiTarget(el)) continue;
+      if (isLikelyBlockingOverlay(el)) return el;
+    }
+  } catch (_) {}
+
+  return null;
+}
+
+async function waitForNoLoadingIndicator({
+  timeoutMs = DEFAULT_WAIT.loadingIndicatorTimeoutMs
+} = {}) {
+  const start = performance.now();
+  let lastHeartbeat = start;
+  while (performance.now() - start < timeoutMs) {
+    const indicator = findVisibleLoadingIndicator();
+    if (!indicator) return { ok: true };
+    const now = performance.now();
+    if (now - lastHeartbeat > 3000) {
+      lastHeartbeat = now;
+      console.log(`[autotest][replay] ⏳ Still blocked by a loading indicator after ${Math.round((now - start) / 1000)}s`, {
+        indicator: describeElementForLog(indicator),
+        text: getElementText(indicator).substring(0, 100)
+      });
+    }
+    await nextFrame();
+  }
+  return { ok: false, error: "A loading indicator is still visible after timeout.", code: "LOADER_STILL_VISIBLE" };
+}
+
+// Runs the DOM/network/loader checks as ONE continuous poll loop instead of
+// three sequential ones. Calling waitForDOMStable() then waitForNetworkIdle()
+// then waitForNoLoadingIndicator() back-to-back leaves gaps where nothing is
+// actively watching — e.g. a delayed prefill fetch that starts right in the
+// gap between two of those calls (or right after the last one returns) slips
+// through undetected. Here all three signals are re-checked every frame for
+// the whole window, so something that starts a few seconds in still resets
+// the "quiet" timer and gets waited out.
+async function waitForPageIdle({
+  quietMs = DEFAULT_WAIT.pageIdleQuietMs,
+  timeoutMs = DEFAULT_WAIT.pageIdleTimeoutMs,
+  loaderTimeoutMs = DEFAULT_WAIT.loadingIndicatorTimeoutMs
+} = {}) {
+  // Phase 1: a visible loading overlay gets its own dedicated, 10-minute wait,
+  // separate from (and before) the fast ambient DOM/network quiet check
+  // below. It's a much stronger "not ready" signal than background chatter,
+  // so unlike phase 2 below, exhausting this window is treated as a real
+  // failure by performStep() (which aborts the whole replay) rather than
+  // proceeding against a page that's still loading.
+  const loaderResult = await waitForNoLoadingIndicator({ timeoutMs: loaderTimeoutMs });
+  if (!loaderResult.ok) return loaderResult;
+
+  patchNetworkTracking();
+  const root = document.documentElement;
+  let lastUnsettled = performance.now();
+  const observer = new MutationObserver((mutations) => {
+    // Ignore mutations that are just network-tracker-main.js reporting its
+    // own state — those are handled explicitly via mainWorldBusy below, and
+    // double-counting them here doesn't add signal, just noise in the diff.
+    const realMutation = mutations.some((m) =>
+      !(m.type === "attributes" && m.target === root &&
+        (m.attributeName === "data-autotest-net-pending" || m.attributeName === "data-autotest-net-last-activity"))
+    );
+    if (realMutation) lastUnsettled = performance.now();
+  });
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    characterData: true
+  });
+
+  const start = performance.now();
+  try {
+    while (performance.now() - start < timeoutMs) {
+      const now = performance.now();
+      // networkTracker only sees fetch/XHR calls the extension's own isolated
+      // world makes — it can't see the page's real network calls (those run
+      // in the MAIN world, a separate JS realm with its own fetch/XHR).
+      // network-tracker-main.js patches the real ones and reports back via
+      // DOM attributes, which (unlike JS state) are visible across worlds.
+      const isolatedWorldBusy = networkTracker.pending > 0 || (now - networkTracker.lastActivity) < quietMs;
+      const mainWorldPending = Number(root.getAttribute("data-autotest-net-pending") || "0");
+      const mainWorldLastActivity = Number(root.getAttribute("data-autotest-net-last-activity") || "0");
+      const mainWorldBusy = mainWorldPending > 0 || (mainWorldLastActivity && (Date.now() - mainWorldLastActivity) < quietMs);
+      const loaderVisible = !!findVisibleLoadingIndicator();
+      if (isolatedWorldBusy || mainWorldBusy || loaderVisible) {
+        lastUnsettled = now;
+      }
+      if (now - lastUnsettled >= quietMs) return { ok: true };
+      await nextFrame();
+    }
+    // Note: unlike the phase-1 loader timeout above, this stays best-effort —
+    // some pages legitimately never go fully network/DOM quiet (analytics
+    // beacons, countdown timers), so proceeding anyway avoids the whole
+    // replay aborting over background chatter that isn't actually blocking.
+    return { ok: false, error: "Page did not settle (DOM/network/loading indicator) within timeout.", code: "PAGE_NOT_SETTLED" };
+  } finally {
+    observer.disconnect();
+  }
 }
 
 /**
@@ -2215,18 +2911,22 @@ function getOpenDialog() {
   if (nativeDialog) return nativeDialog;
 
   // ARIA dialog roles that are visible
-  const ariaDialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"]');
+  const ariaDialogs = document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"]');
   for (const d of ariaDialogs) {
     if (isElementVisible(d)) return d;
   }
 
-  // Common class-based modals (Bootstrap, Tailwind, Material, etc.)
+  // Common class-based modals (Bootstrap, Tailwind, Material, jQuery UI, etc.)
+  // jQuery UI's .dialog() widget (which AEM Forms guide "popup" panels are
+  // commonly rendered through) wraps content in .ui-dialog; it also sets
+  // role="dialog" in modern versions, but older markup may omit it.
   const classPatterns = [
     '.modal.show',          // Bootstrap
     '.modal[style*="display: block"]',
     '[data-modal][aria-hidden="false"]',
     '.MuiDialog-root',       // Material UI
     '.ant-modal-root',       // Ant Design
+    '.ui-dialog',            // jQuery UI (used by AEM Forms guide popup panels)
     '[class*="modal"][class*="open"]',
     '[class*="modal"][class*="visible"]',
     '[class*="dialog"][class*="open"]',
@@ -2287,6 +2987,79 @@ async function dismissOpenDialog() {
   return true;
 }
 
+// AEM Forms' typeahead widget (guideDropDownList) hides the real <select>
+// (display:none) and shows a plain text <input> next to it — typing into
+// that input triggers a live search-as-you-type API call, and clicking a
+// resulting option sets the hidden select's value. Setting the whole value
+// in one shot (our normal fast path) never triggers that search at all, so
+// the option list never renders and a later click step meant to select from
+// it can't find anything. Detect this pattern by looking for a hidden
+// <select> among nearby ancestors.
+function isTypeaheadInput(el) {
+  if (!el || el.tagName?.toLowerCase() !== 'input') return false;
+  // jQuery UI autocomplete (and similar widgets) mark the input itself with
+  // a class like "ui-autocomplete-input" — no hidden <select> involved at
+  // all, so the AEM-style check below never catches it. Check this directly
+  // first since it's the cheapest, most reliable signal for that pattern.
+  if (/autocomplete|typeahead/i.test(el.className || '')) return true;
+  // AEM Forms' "Drop Down List" component (guideDropDownList) renders this
+  // way whenever it's *not* a plain <select> — including the API-backed
+  // lookup variant (e.g. an SM Code field with a REST data source), which
+  // has no hidden <select> fallback at all, just this bare <input>. Its
+  // id/name always carry the widget's "guidedropdownlist" token, so that's
+  // a reliable signal on its own, independent of the hidden-<select> check
+  // below (which only catches the local-options variant).
+  if (/guidedropdownlist/i.test(el.id || '') || /guidedropdownlist/i.test(el.name || '')) return true;
+  let node = el.parentElement;
+  for (let i = 0; i < 3 && node; i++, node = node.parentElement) {
+    const hiddenSelect = node.querySelector?.('select');
+    if (hiddenSelect && !isElementVisible(hiddenSelect)) return true;
+  }
+  return false;
+}
+
+// Types text one character at a time via execCommand('insertText'), firing a
+// real InputEvent per character — required for typeahead widgets that ignore
+// a bulk value assignment and only react to character-level input to
+// trigger their live search.
+async function typeCharByChar(el, text) {
+  el.focus();
+  if (el.value) {
+    // Clear via the native value setter (bypasses React's tracked-value
+    // descriptor), same technique as the main non-typeahead input path
+    // below — NOT execCommand('selectAll')/('delete'), which is not
+    // reliable for fully clearing a React-controlled input. This matters
+    // most on a SECOND pass through the same typeahead field, once it
+    // already holds a previously-selected option's display text: an
+    // incomplete execCommand-based clear would leave stale characters
+    // behind, and the freshly-typed text would get inserted alongside
+    // them — producing a garbled search query that the live-search API
+    // has no match for (surfaced in the UI as "No data").
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype, 'value'
+    )?.set;
+    if (nativeInputValueSetter) {
+      nativeInputValueSetter.call(el, '');
+    } else {
+      el.value = '';
+    }
+    el.dispatchEvent(new Event('input', { bubbles: true }));
+    // Give the framework a tick to process the clear before typing begins,
+    // so the first typed character doesn't race the clear's own re-render.
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  for (const char of String(text ?? "")) {
+    const code = char.charCodeAt(0);
+    const keyEventInit = { key: char, bubbles: true, cancelable: true, keyCode: code, which: code };
+    el.dispatchEvent(new KeyboardEvent("keydown", keyEventInit));
+    el.dispatchEvent(new KeyboardEvent("keypress", keyEventInit));
+    document.execCommand('insertText', false, char);
+    el.dispatchEvent(new KeyboardEvent("keyup", keyEventInit));
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
 async function performStep(step) {
   const type = step?.type;
   console.log("[autotest][replay] performStep", { type, selectorType: step?.selector?.primary?.type || null });
@@ -2324,9 +3097,31 @@ async function performStep(step) {
     return { ok: true, debug: consumeDebugBuffer() };
   }
 
-  const domStable = await waitForDOMStable();
-  if (!domStable.ok) {
-    return { ok: false, error: domStable.error, code: "DOM_UNSTABLE", debug: consumeDebugBuffer() };
+  // Gate every step (not just navigation) on the form being genuinely idle —
+  // no pending mutations, no in-flight requests, no visible loader — before
+  // we touch it. This catches both the previous step kicking off an async
+  // validation call, and a delayed fetch (e.g. a prefill lookup) that starts
+  // a moment after the page first looked quiet.
+  const pageIdle = await waitForPageIdle();
+  if (!pageIdle.ok) {
+    if (pageIdle.code === "LOADER_STILL_VISIBLE") {
+      // A loading indicator (e.g. a popup that never finished loading) was
+      // still visible after the full 10-minute wait — proceeding anyway
+      // would mean interacting with a page we know isn't ready, so fail the
+      // step outright. In non-soft mode this aborts the whole replay rather
+      // than silently producing wrong/missed field values.
+      console.error("[autotest][replay] Loading indicator never cleared, aborting step:", pageIdle.error);
+      return {
+        ok: false,
+        error: pageIdle.error,
+        code: "LOADING_INDICATOR_TIMEOUT",
+        debug: consumeDebugBuffer()
+      };
+    }
+    // DOM/network settle timeout stays best-effort: some pages legitimately
+    // never go fully quiet (analytics beacons, countdown timers), so wait up
+    // to the timeout and proceed anyway rather than aborting the whole replay.
+    console.warn("[autotest][replay] Page never fully settled before step, continuing:", pageIdle.error);
   }
 
   // ============================================================================
@@ -2744,9 +3539,15 @@ async function performStep(step) {
       await new Promise(resolve => setTimeout(resolve, 60));
       
       // Check if the page is about to reload (URL unchanged = SPA should have
-      // handled it; if DOM hasn't changed, React handler likely didn't fire)
+      // handled it; if DOM hasn't changed, React handler likely didn't fire).
+      // A click that correctly opened a confirm dialog ("Are you sure you
+      // want to leave?") is expected to leave the URL unchanged too — it's
+      // not supposed to navigate until the user answers. Escalating in that
+      // case (extra React fiber invocation, then a synthetic Enter keypress
+      // fired at clickTarget) risks landing that Enter on whatever the new
+      // dialog focused instead, silently dismissing it right after it opened.
       const urlAfter = window.location.href;
-      if (urlAfter === urlBefore) {
+      if (urlAfter === urlBefore && !getOpenDialog()) {
         // Try direct React fiber invocation as a second attempt
         const reactHandled = tryReactOnClick(clickTarget);
         if (!reactHandled) {
@@ -2850,17 +3651,9 @@ async function performStep(step) {
       }
     }
     
-    // Wait for DOM and network to stabilize, but don't fail if they don't
-    const postDom = await waitForDOMStable();
-    const postNet = await waitForNetworkIdle();
-    
-    if (!postDom.ok) {
-      console.warn("[autotest][replay] DOM still updating after click, continuing anyway");
-    }
-    if (!postNet.ok) {
-      console.warn("[autotest][replay] Network still active after click, continuing anyway");
-    }
-    
+    // No post-action wait here — the next step's own pre-step gate in
+    // performStep() already waits for the page to settle before it acts, so
+    // waiting again here would just pay the same quiet-period cost twice.
     return {
       ok: true,
       meta: { usedSelector: used },
@@ -2952,11 +3745,7 @@ async function performStep(step) {
         el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
       }
       
-      const postDom = await waitForDOMStable();
-      if (!postDom.ok) {
-        console.warn("[autotest][replay] DOM still updating after radio/checkbox click, continuing");
-      }
-      
+      // No post-action wait — the next step's pre-step gate covers this.
       return {
         ok: true,
         meta: { usedSelector: used },
@@ -3014,8 +3803,7 @@ async function performStep(step) {
         } catch (e) { /* ignore */ }
       }
       
-      const postDom = await waitForDOMStable();
-      if (!postDom.ok) console.warn("[autotest][replay] DOM still updating after custom toggle click");
+      // No post-action wait — the next step's pre-step gate covers this.
       return {
         ok: true,
         meta: { usedSelector: used },
@@ -3039,10 +3827,7 @@ async function performStep(step) {
       }
       el.dispatchEvent(new Event("change", { bubbles: true }));
       el.dispatchEvent(new Event("input", { bubbles: true }));
-      const postDom = await waitForDOMStable();
-      if (!postDom.ok) {
-        console.warn("[autotest][replay] DOM still updating after select change, continuing");
-      }
+      // No post-action wait — the next step's pre-step gate covers this.
       return {
         ok: true,
         meta: { usedSelector: used },
@@ -3075,30 +3860,91 @@ async function performStep(step) {
     
     // Focus and clear existing value with realistic events
     el.focus();
-    
+
+    const targetValue = step?.value ?? "";
+
+    // Typeahead widgets need character-level typing to trigger their own
+    // live search — a one-shot value assignment never fires it, so the
+    // option list a later click step depends on would never render.
+    if (isTypeaheadInput(el)) {
+      // If the field already shows exactly this value, there's nothing to
+      // type. This guards against a "change" step that was only ever the
+      // native side-effect of a PRECEDING key-driven selection (type →
+      // ArrowDown → Enter) settling, not a separate user action — common
+      // for widgets like AEM's guideDropDownList, where selecting a result
+      // via Enter fires a native 'change' with the now-resolved value.
+      // Retyping that same value character-by-character would reopen a
+      // brand-new live search for it, but with no follow-up
+      // ArrowDown/Enter/click step recorded to resolve THAT search, the
+      // field is left showing the right text with nothing actually
+      // committed underneath (the hidden <select> this widget maintains
+      // never gets set) — surfaced downstream as a "required field" error
+      // despite the visible value looking correct.
+      if (targetValue !== "" && String(el.value ?? "").trim() === String(targetValue).trim()) {
+        console.log("[autotest][replay] Typeahead already shows the target value — skipping retype to avoid reopening an unresolved search:", targetValue);
+        return {
+          ok: true,
+          meta: { usedSelector: used },
+          debug: { ...consumeDebugBuffer(), selectorAttempts }
+        };
+      }
+      console.log("[autotest][replay] Typeahead input detected — typing char-by-char:", targetValue);
+      await typeCharByChar(el, targetValue);
+      const postIdle = await waitForPageIdle();
+      if (!postIdle.ok) {
+        console.warn("[autotest][replay] Page still settling after typeahead typing, continuing:", postIdle.error);
+      }
+      return {
+        ok: true,
+        meta: { usedSelector: used },
+        debug: { ...consumeDebugBuffer(), selectorAttempts }
+      };
+    }
+
+    const elDesc = describeElementForLog(el);
+
     // Use native input setter to bypass React's synthetic event system
     const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, 'value'
     )?.set || Object.getOwnPropertyDescriptor(
       window.HTMLTextAreaElement.prototype, 'value'
     )?.set;
-    
+
     if (nativeInputValueSetter) {
-      nativeInputValueSetter.call(el, step?.value ?? "");
+      nativeInputValueSetter.call(el, targetValue);
     } else {
-      el.value = step?.value ?? "";
+      el.value = targetValue;
     }
-    
+
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
     el.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
 
-    // Wait for DOM to stabilize, but don't fail if it doesn't
-    const postDom = await waitForDOMStable();
-    if (!postDom.ok) {
-      console.warn("[autotest][replay] DOM still updating after input, continuing anyway");
+    if (el.value !== targetValue) {
+      console.warn(`[autotest][replay] Value mismatch immediately after dispatch — expected "${targetValue}", got "${el.value}" on`, elDesc);
     }
-    
+
+    // Fire-and-forget delayed re-check: some frameworks (React controlled
+    // inputs, AEM guide field validation) reset the value a tick or more
+    // after blur — e.g. an onBlur validator that rejects the value and
+    // clears it, or a duplicate/stale element getting the value while a
+    // different visible element is what's actually on screen. Only logs if
+    // something actually went wrong — doesn't block the step's return.
+    const capturedEl = el;
+    setTimeout(() => {
+      const laterValue = capturedEl.value;
+      if (laterValue !== targetValue) {
+        console.warn(
+          `[autotest][replay] Value changed after step — 300ms later, expected "${targetValue}", found "${laterValue}" (element still in DOM: ${document.contains(capturedEl)}) on`,
+          elDesc
+        );
+      }
+    }, 300);
+
+    // No post-action wait — the next step's pre-step gate covers this
+    // (typing/blurring a field commonly triggers a debounced validation call,
+    // e.g. OTP/PAN/pincode lookups, same as a click can).
+
     return {
       ok: true,
       meta: { usedSelector: used },
@@ -3510,25 +4356,18 @@ async function performStep(step) {
   return { ok: false, error: `Unsupported step type: ${type}`, code: "UNSUPPORTED_STEP" };
 }
 
-// Helper function to check element visibility
-function isElementVisible(elem) {
-  if (!elem) return false;
-  const style = window.getComputedStyle(elem);
-  const rect = elem.getBoundingClientRect();
-  return (
-    style.display !== 'none' &&
-    style.visibility !== 'hidden' &&
-    style.opacity !== '0' &&
-    rect.width > 0 &&
-    rect.height > 0
-  );
-}
-
 async function sendStep(step) {
   if (!state.isRecording) return;
   if (isDuplicate(step)) return;
+  if (!step.id) step.id = `${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  // Remember the step behind a click/input/change/submit so a suppressed SPA
+  // navigation right after it (see handleNavigation) can patch this step's
+  // relativePath to the page it actually landed on.
+  if (step.type === "click" || step.type === "input" || step.type === "change" || step.type === "submit") {
+    state.lastInteractionStep = step;
+  }
   await chrome.runtime.sendMessage({ type: "record_step", step });
-  
+
   // Learn from recording — every recorded action is a confirmed-good interaction
   learnFromRecordedStep(step);
 }
@@ -3545,7 +4384,7 @@ function learnFromRecordedStep(step) {
 }
 
 function makeStep(type, target, value) {
-  const { relativePath, queryParams } = computeRelativeLocation(window.location.href, state.baseUrl);
+  const { relativePath, queryParams, hash } = computeRelativeLocation(window.location.href, state.baseUrl);
   let selector = generateSelector(target);
   let matchInfo = null;
   
@@ -3645,6 +4484,7 @@ function makeStep(type, target, value) {
     timestamp: Date.now(),
     relativePath,
     queryParams,
+    hash,
     selector,
     value: value ?? null,
     elementName, // Store element name for display
@@ -3702,12 +4542,54 @@ function resolveClickTarget(target) {
       if (el.getAttribute?.('tabindex') != null && el.onclick) return el;
       // Found a label wrapping a hidden input
       if (pTag === 'label') return el;
+      // Custom toggle/switch widgets (e.g. PrimeFaces-style "switchbutton")
+      // commonly lay out their visible thumb/handle and labels as SIBLINGS
+      // of the actual checkbox holding the real value, all under one
+      // wrapper div — rather than nesting the checkbox inside the visible
+      // part. Walking only ancestors (as this loop otherwise does) never
+      // finds a sibling, so a click squarely on the handle — the most
+      // natural place to click/tap to toggle it — resolves to nothing
+      // recordable. Check for a directly-owned toggle input at each
+      // ancestor level before giving up on it.
+      const siblingToggle = el.querySelector?.(
+        ':scope > input[type="checkbox"], :scope > input[type="radio"], :scope > [role="checkbox"], :scope > [role="radio"], :scope > [role="switch"]'
+      );
+      if (siblingToggle) return siblingToggle;
       el = el.parentElement;
       depth++;
     }
   }
-  
+
   return target;
+}
+
+// resolveClickTarget() walks up looking for an interactive ancestor, but
+// falls back to returning the original element unchanged if it never finds
+// one within 6 levels — e.g. a plain wrapper div with no text, no label, no
+// click handler, no role. A click landing there is almost always incidental
+// (padding, whitespace, a decorative icon, an AEM authoring artifact like
+// cq-placeholder) rather than a genuine interaction. Recording it produces a
+// step that's either meaningless or impossible to find again on replay.
+// Reference: a sibling recorder (hdfc-form-Filler) avoids this entirely by
+// only recording clicks on button/input[type=submit|button] — too narrow for
+// us (we also need radio/checkbox/custom ARIA toggles/div-styled buttons),
+// but its "reject empty text + no name" guard is the right general filter.
+function isMeaninglessClickTarget(el) {
+  if (!el) return true;
+  const tag = el.tagName?.toLowerCase();
+  const interactiveTags = new Set(['input', 'button', 'select', 'textarea', 'a']);
+  if (interactiveTags.has(tag)) return false;
+  if (el.getAttribute?.('role')) return false; // explicit ARIA role — treat as intentional
+  if (el.onclick || el.getAttribute?.('tabindex') != null) return false;
+  if ((el.textContent || '').trim()) return false;
+  if (el.getAttribute?.('aria-label') || el.getAttribute?.('title') || el.getAttribute?.('name')) return false;
+  // A wrapper with no text/label of its own but that directly contains a
+  // real form control is still a meaningful target — clicking it is how
+  // users commonly focus/activate the control inside (e.g. a styled
+  // "textField" div wrapping a plain <input>).
+  if (el.querySelector?.('input, textarea, select, button, a')) return false;
+  // Nothing suggests this is a genuine, findable interactive element.
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -4028,6 +4910,10 @@ function handleClick(event) {
   if (!state.isRecording) return;
   if (event.button !== 0) return;
   if (isExtensionUiTarget(event.target)) return;
+  if (isAemAuthoringPlaceholder(event.target)) {
+    console.log("[autotest][record] Ignoring click on AEM authoring placeholder (cq-placeholder) — not a real page element, would never be findable on replay.");
+    return;
+  }
 
   // ── Assert mode: intercept click to capture assertion instead ──
   if (state.isAssertMode) {
@@ -4045,6 +4931,25 @@ function handleClick(event) {
   const inputType = target.getAttribute?.('type')?.toLowerCase();
   const targetRole = target.getAttribute?.('role')?.toLowerCase();
   const isInputElement = (tagName === "input" || tagName === "textarea" || tagName === "select" || target.isContentEditable);
+
+  // Diagnostic: full visibility into what handleClick resolved to and why,
+  // for tracking down clicks that silently don't produce a step (e.g. a
+  // custom toggle/switch widget resolving to an unexpected ancestor).
+  console.log("[autotest][record][click-debug]", {
+    originalTag: event.target?.tagName?.toLowerCase(),
+    originalId: event.target?.id || null,
+    originalClass: typeof event.target?.className === "string" ? event.target.className.slice(0, 80) : null,
+    originalText: (event.target?.textContent || "").trim().slice(0, 40),
+    resolvedTag: tagName,
+    resolvedId: target?.id || null,
+    resolvedClass: typeof target?.className === "string" ? target.className.slice(0, 80) : null,
+    resolvedRole: targetRole || null,
+    resolvedText: (target?.textContent || "").trim().slice(0, 40),
+    isInputElement,
+    willBeMeaningless: !isInputElement && targetRole !== 'checkbox' && targetRole !== 'radio' && targetRole !== 'switch'
+      && !(tagName === 'input' && (inputType === 'radio' || inputType === 'checkbox'))
+      ? isMeaninglessClickTarget(target) : null
+  });
   
   // ── Native radio / checkbox: always record as CLICK immediately ──
   const isNativeCheckRadio = tagName === 'input' && (inputType === 'radio' || inputType === 'checkbox');
@@ -4073,7 +4978,7 @@ function handleClick(event) {
     const clickTime = Date.now();
     state.lastClickTarget = target;
     state.lastClickTime = clickTime;
-    
+
     setTimeout(() => {
       if (state.lastClickTarget === target && state.lastClickTime === clickTime) {
         flushPendingInput();
@@ -4086,7 +4991,17 @@ function handleClick(event) {
     return;
   }
   
-  // For non-input elements, send click immediately
+  // For non-input elements, send click immediately — unless nothing about
+  // the resolved target suggests it's a genuine, findable interactive
+  // element (no text, no label, no role, no handler), in which case this is
+  // almost certainly an incidental click, not something worth replaying.
+  if (isMeaninglessClickTarget(target)) {
+    console.log("[autotest][record] Ignoring click — no text/label/role/handler on resolved target, likely incidental:", {
+      tag: target.tagName?.toLowerCase(),
+      class: typeof target.className === "string" ? target.className.slice(0, 60) : null
+    });
+    return;
+  }
   flushPendingInput();
   sendStep(makeStep("click", target));
   state.lastClickSentAt = Date.now();
@@ -4114,20 +5029,20 @@ function handleInput(event) {
   // Check if this input is on the element we just clicked
   const timeSinceClick = Date.now() - state.lastClickTime;
   const isSameAsClickedElement = state.lastClickTarget === target;
-  
+
   // If input happens shortly after clicking the same element, cancel the pending click
   if (isSameAsClickedElement && timeSinceClick < CLICK_TO_INPUT_WINDOW_MS) {
     state.lastClickTarget = null;
     state.lastClickTime = 0;
   }
-  
+
   const step = makeStep(event.type, target, target.value);
-  
+
   // Check if this is input on the same field as pending step
-  const sameField = state.pendingInputStep && 
+  const sameField = state.pendingInputStep &&
     state.pendingInputStep.selector?.primary?.value === step.selector?.primary?.value &&
     state.pendingInputStep.relativePath === step.relativePath;
-  
+
   if (sameField) {
     // Update pending step with new value instead of creating new step
     state.pendingInputStep.value = step.value;
@@ -4170,36 +5085,81 @@ function handleInput(event) {
 function handleSubmit(event) {
   if (!state.isRecording) return;
   if (isExtensionUiTarget(event.target)) return;
+
+  // A <button type="submit"> inside a <form> fires this native "submit"
+  // event as an automatic side-effect of the click already recorded a
+  // moment ago. Recording it as its own step would replay as TWO
+  // submissions of the same form — once from the click's own default
+  // action, once from this step's form.requestSubmit() — which can double
+  // a downstream call (e.g. re-sending an OTP) or hit a form the SPA has
+  // already torn down after the first submit. Same rationale as the
+  // pushState/replaceState suppression in handleNavigation below.
+  const timeSinceClick = Date.now() - (state.lastClickSentAt || 0);
+  if (timeSinceClick < CLICK_NAV_SUPPRESS_MS) {
+    console.log("[autotest][record] Suppressing submit event —", timeSinceClick + "ms after click (native side-effect of the submit button)");
+    return;
+  }
+
   flushPendingInput(); // Flush any pending input before submit
   sendStep(makeStep("submit", event.target));
 }
 
 /**
  * Time window (ms) after a click within which we suppress pushState /
- * replaceState navigation recordings.  In React SPAs and micro-frontend
- * architectures, clicking a button often triggers history.pushState as
- * part of the SPA transition.  Recording this as a separate "navigation"
- * step would cause a full page reload during replay, which is wrong —
- * the click step alone is sufficient to trigger the SPA transition.
+ * replaceState / popstate / hashchange navigation recordings.  In React SPAs
+ * and micro-frontend architectures, clicking a button often triggers one of
+ * these as part of the SPA transition — e.g. a "Next" button that internally
+ * calls history.back()/history.pushState() to close a step/modal and advance
+ * a wizard.  Recording this as a separate "navigation" step is not just
+ * redundant, it's actively worse: replaying it means reconstructing a URL
+ * from scratch (baseUrl + relativePath + queryParams), which is fragile —
+ * e.g. it silently drops the URL hash fragment (see computeRelativeLocation),
+ * so a site that uses "#addon"-style routing ends up on a URL that looks
+ * right but never renders the section the recording actually needed. The
+ * click step alone is sufficient: replaying it re-triggers the same
+ * history/hash change naturally, with none of that reconstruction risk.
+ *
+ * popstate specifically CAN also be fired by a genuine, deliberate press of
+ * the browser's own back/forward button — which has no preceding in-page
+ * click to correlate with, so it wouldn't fall inside this window anyway.
+ * The only way this suppression swallows a real navigation is a user
+ * coincidentally pressing browser-back within 2s of an unrelated in-page
+ * click — the same small, already-accepted risk pushState/replaceState
+ * suppression below has lived with.
  */
 const CLICK_NAV_SUPPRESS_MS = 2000;
 
 function handleNavigation(kind) {
   if (!state.isRecording) return;
-  
+
   // ── Suppress SPA navigations triggered by a recent click ──
-  // pushState / replaceState fired within CLICK_NAV_SUPPRESS_MS after the
-  // last recorded click are side-effects of that click (React Router,
-  // micro-frontend shell, etc.).  The click step is already recorded;
-  // adding a navigation step would cause a redundant full page reload
-  // during replay.
-  if (kind === 'pushState' || kind === 'replaceState') {
+  // Fired within CLICK_NAV_SUPPRESS_MS after the last recorded click, these
+  // are side-effects of that click (React Router, micro-frontend shell,
+  // etc.).  The click step is already recorded; adding a navigation step
+  // would cause a redundant (and, for popstate/hashchange, URL-reconstruction
+  // -fragile) replay action.
+  if (kind === 'pushState' || kind === 'replaceState' || kind === 'popstate' || kind === 'hashchange') {
     const timeSinceClick = Date.now() - (state.lastClickSentAt || 0);
     if (timeSinceClick < CLICK_NAV_SUPPRESS_MS) {
       console.log("[autotest][record] Suppressing", kind, "navigation —",
         timeSinceClick + "ms after click (SPA transition)");
-      // Update the last click step's relativePath to the NEW path so replay
-      // knows the expected page after the click.
+      // Update the last recorded step's relativePath to the NEW path so the
+      // step list/HUD reflects the page this step actually landed on,
+      // instead of the page it was clicked from.
+      const interactionStep = state.lastInteractionStep;
+      if (interactionStep) {
+        const { relativePath, queryParams, hash } = computeRelativeLocation(window.location.href, state.baseUrl);
+        interactionStep.relativePath = relativePath;
+        interactionStep.queryParams = queryParams;
+        interactionStep.hash = hash;
+        chrome.runtime.sendMessage({
+          type: "patch_step_path",
+          stepId: interactionStep.id,
+          relativePath,
+          queryParams,
+          hash
+        }).catch(() => {});
+      }
       return;
     }
   }
@@ -4244,6 +5204,7 @@ async function startRecording(envOverride) {
   // fetched the environment and passed it through.
   state.env = envOverride || null;
   state.baseUrl = getEnvironmentBaseUrl(state.env);
+  state.lastRecordedFieldValue.clear();
   state.isRecording = true;
   console.log("[autotest][content] Recording started, env:", state.env?.name || "(none)");
 }
@@ -4261,6 +5222,15 @@ function stopRecording() {
 // ── Keyboard recording ──────────────────────────────────────
 const SPECIAL_KEYS = new Set(['Enter', 'Tab', 'Escape', 'Backspace', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown']);
 const MODIFIER_COMBOS = new Set(['a', 'c', 'v', 'x', 'z', 's', 'f']); // Ctrl/Cmd + key
+// Backspace/Delete while actively typing in a text field are pure
+// self-corrections — the *next* input event already reflects the edited
+// value. Recording them as their own step (which flushes whatever was typed
+// so far first) fragments one edit into many: typing "adi", backspacing, and
+// retyping "agarwal" becomes 5+ separate recorded steps instead of one final
+// "agarwal". Replaying all of those fires the page's own field validation
+// repeatedly in rapid succession — much faster than the user actually typed —
+// which some forms' async validation can't handle cleanly.
+const TEXT_CORRECTION_KEYS = new Set(['Backspace', 'Delete']);
 
 function handleKeyDown(event) {
   if (!state.isRecording) return;
@@ -4281,6 +5251,14 @@ function handleKeyDown(event) {
     // Only record Tab if the user isn't currently typing in an input
     const tag = event.target.tagName?.toLowerCase();
     if (tag === 'input' || tag === 'textarea') return;
+  }
+
+  // Don't record/flush Backspace or Delete while actively editing a text
+  // field — let it be absorbed into the ongoing typing session instead (see
+  // TEXT_CORRECTION_KEYS above).
+  if (TEXT_CORRECTION_KEYS.has(key) && !hasModifier) {
+    const tag = event.target.tagName?.toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || event.target.isContentEditable) return;
   }
 
   flushPendingInput();
@@ -4641,10 +5619,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "replay_wait_ready") {
     Promise.resolve()
       .then(async () => {
-        const dom = await waitForDOMStable();
-        if (!dom.ok) return { ok: false, error: dom.error, code: "DOM_UNSTABLE" };
-        const net = await waitForNetworkIdle();
-        if (!net.ok) return { ok: false, error: net.error, code: "NETWORK_BUSY" };
+        // Best-effort: some pages never go fully quiet (animated loaders,
+        // analytics beacons, keep-alive pings). Wait up to the timeout for
+        // real idle, but don't abort the whole replay if it never arrives —
+        // just proceed with a warning, same as the post-action waits do.
+        const pageIdle = await waitForPageIdle();
+        if (!pageIdle.ok) console.warn("[autotest][replay] Page never fully settled post-navigation, continuing:", pageIdle.error);
         return { ok: true };
       })
       .then((resp) => sendResponse(resp))

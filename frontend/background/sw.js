@@ -297,20 +297,8 @@ async function startRecordingOnTab(tabId) {
 
   // Content script wasn't reachable — inject it only if not already present, then retry.
   try {
-    let alreadyLoaded = false;
-    try {
-      const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: () => !!window.__autotestContentLoaded });
-      alreadyLoaded = r?.result === true;
-    } catch {}
-    if (!alreadyLoaded) {
-      console.log("[sw] Injecting content scripts…");
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: ["content/hud.js", "content/content.js"]
-      });
-    } else {
-      console.log("[sw] Content scripts already present, skipping injection.");
-    }
+    const injected = await ensureContentScriptsInjected(tabId);
+    console.log(injected ? "[sw] Injected content scripts…" : "[sw] Content scripts already present, skipping injection.");
     // Give the content script a moment to initialise its onMessage listener.
     await new Promise(r => setTimeout(r, 300));
     console.log("[sw] Retrying recorder_start after injection…");
@@ -393,7 +381,15 @@ function waitForTabLoad(tabId, timeoutMs = 60000) {
 
 // Waits up to timeoutMs for any tab to load whose hostname matches domain.
 // Also checks existing tabs immediately in case the tab already loaded before this is called.
-function waitForTabWithDomain(domain, timeoutMs = 30000) {
+//
+// Scoped to `windowId` (the replay's own window) when provided — matching
+// against every tab in the entire browser is unsafe: a same-hostname tab
+// left open in a DIFFERENT window from an unrelated recording/session (e.g.
+// a leftover tab from testing a different journey) would be silently
+// adopted as "the" redirect target, hijacking replay onto the wrong tab
+// even though the hostname genuinely matches. windowId is only omitted when
+// no origin tab could be resolved, as a last-resort fallback.
+function waitForTabWithDomain(domain, timeoutMs = 30000, windowId = null) {
   return new Promise((resolve) => {
     let settled = false;
     function done(tab) {
@@ -406,10 +402,11 @@ function waitForTabWithDomain(domain, timeoutMs = 30000) {
     const timer = setTimeout(() => done(null), timeoutMs);
     function onUpdated(id, info, tab) {
       if (info.status !== 'complete' || !tab.url) return;
+      if (windowId != null && tab.windowId !== windowId) return;
       try { if (new URL(tab.url).hostname === domain) done(tab); } catch (_) {}
     }
     chrome.tabs.onUpdated.addListener(onUpdated);
-    chrome.tabs.query({}).then(tabs => {
+    chrome.tabs.query(windowId != null ? { windowId } : {}).then(tabs => {
       for (const tab of tabs) {
         if (tab.status === 'complete' && tab.url) {
           try { if (new URL(tab.url).hostname === domain) { done(tab); return; } } catch (_) {}
@@ -553,6 +550,23 @@ function buildReplayUrl(env, step) {
     throw new Error("Selected environment has no baseUrl.");
   }
   const url = new URL(baseUrl);
+
+  // Environments are a flat, global list shared across every recording in
+  // this extension install (see ENV_KEY) — resolveEnvForStep() can fall
+  // through to a default environment that has nothing to do with the
+  // journey being replayed (e.g. one auto-created from a completely
+  // unrelated recording/domain visited at some point in this browser).
+  // Since step.tabDomain records the actual domain this step was recorded
+  // against, cross-checking it here is a last line of defense: it turns a
+  // silent "navigate to the wrong site" into a clear, immediate error
+  // instead of quietly combining a wrong origin with this step's (correct)
+  // relativePath into a URL that looks plausible but points nowhere useful.
+  if (step?.tabDomain && url.hostname !== step.tabDomain) {
+    throw new Error(
+      `Environment "${env?.name || env?.id || "?"}" (${url.hostname}) does not match this step's recorded domain "${step.tabDomain}". Refusing to navigate to avoid combining the wrong site with this step's path — check that the correct environment is selected for this recording.`
+    );
+  }
+
   const rel = String(step?.relativePath || "/");
   const joinedPath = rel.startsWith("/") ? rel : `/${rel}`;
   url.pathname = joinPaths(url.pathname, joinedPath);
@@ -565,6 +579,11 @@ function buildReplayUrl(env, step) {
       url.searchParams.append(key, String(values));
     }
   }
+  // Some sites route/render based on the URL hash (e.g. an "#addon" section
+  // that only loads once that fragment is present) — dropping it here would
+  // build a URL that "looks" like a match on path+query alone but never
+  // triggers the actual content this step needs.
+  url.hash = String(step?.hash || "");
   return url.toString();
 }
 
@@ -574,42 +593,100 @@ function joinPaths(basePath, relPath) {
   return `/${[base, rel].filter(Boolean).join("/")}`;
 }
 
-function waitForTabComplete(tabId, timeoutMs = 30000) {
+// requireFreshLoad=true skips the "already complete" fast path and only
+// resolves on a genuine future onUpdated "complete" event. Use this whenever
+// the caller is about to (or just did) trigger a navigation itself — checking
+// tab.status synchronously right after chrome.tabs.update() is racy, since
+// Chrome hasn't always flipped status away from the *previous* page's
+// "complete" by the time we read it, which let replay treat a page as loaded
+// before it had even started navigating.
+function waitForTabComplete(tabId, timeoutMs = 30000, { requireFreshLoad = false } = {}) {
   return new Promise((resolve, reject) => {
-    // First check if tab is already complete
+    const timeout = setTimeout(() => {
+      chrome.tabs.onUpdated.removeListener(listener);
+      // Don't reject - some pages never fully "complete" but are usable
+      console.warn("[autotest] Navigation timeout, but continuing anyway...");
+      resolve(); // Resolve instead of reject to allow replay to continue
+    }, timeoutMs);
+
+    function finish() {
+      clearTimeout(timeout);
+      chrome.tabs.onUpdated.removeListener(listener);
+      console.log("[autotest] Tab loaded successfully");
+      resolve();
+    }
+
+    function listener(updatedTabId, info) {
+      if (updatedTabId !== tabId) return;
+      if (info.status === "complete") finish();
+    }
+
+    // Attach the listener before any synchronous check so we never miss a
+    // transition that happens concurrently with it.
+    chrome.tabs.onUpdated.addListener(listener);
+
+    if (requireFreshLoad) return;
+
     chrome.tabs.get(tabId, (tab) => {
       if (chrome.runtime.lastError) {
+        clearTimeout(timeout);
+        chrome.tabs.onUpdated.removeListener(listener);
         reject(new Error(`Tab not found: ${chrome.runtime.lastError.message}`));
         return;
       }
-      
       if (tab.status === "complete") {
         console.log("[autotest] Tab already complete");
-        resolve();
-        return;
+        finish();
       }
-      
-      // Otherwise, wait for it to complete
-      const timeout = setTimeout(() => {
-        chrome.tabs.onUpdated.removeListener(listener);
-        // Don't reject - some pages never fully "complete" but are usable
-        console.warn("[autotest] Navigation timeout, but continuing anyway...");
-        resolve(); // Resolve instead of reject to allow replay to continue
-      }, timeoutMs);
-
-      function listener(updatedTabId, info) {
-        if (updatedTabId !== tabId) return;
-        if (info.status === "complete") {
-          clearTimeout(timeout);
-          chrome.tabs.onUpdated.removeListener(listener);
-          console.log("[autotest] Tab loaded successfully");
-          resolve();
-        }
-      }
-
-      chrome.tabs.onUpdated.addListener(listener);
     });
   });
+}
+
+// Poll the content script with lightweight pings until it responds, instead of
+// blindly sleeping a fixed duration. Resolves as soon as the script is alive
+// (typically well under 500ms) and only gives up after timeoutMs.
+async function waitForContentScriptAlive(tabId, { timeoutMs = 8000, intervalMs = 100 } = {}) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const resp = await chrome.tabs.sendMessage(tabId, { type: "ping" });
+      if (resp?.alive) return true;
+    } catch (_) {
+      // Content script not yet listening — keep polling.
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  return false;
+}
+
+// content.js/hud.js are ALSO declaratively auto-injected by manifest.json on
+// every http/https page at document_idle. Re-injecting them unconditionally
+// (as several call sites used to) races with that auto-injection and, when
+// it loses the race, crashes with "Identifier 'state'/'HUD_ID' has already
+// been declared" — since top-level const/class declarations can't be
+// redeclared in the same JS realm. That crash silently aborts the ENTIRE
+// re-injected script, including whatever recovery step it was meant to
+// perform. Checking window.__autotestContentLoaded first makes this safe.
+async function ensureContentScriptsInjected(tabId, { includeHud = true } = {}) {
+  let contentLoaded = false;
+  let hudLoaded = false;
+  try {
+    const [r] = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => ({ content: !!window.__autotestContentLoaded, hud: !!window.__autotestHudLoaded })
+    });
+    contentLoaded = r?.result?.content === true;
+    hudLoaded = r?.result?.hud === true;
+  } catch {
+    // Tab may not support scripting (e.g. chrome:// pages) — treat as not loaded.
+  }
+
+  const files = [];
+  if (includeHud && !hudLoaded) files.push("content/hud.js");
+  if (!contentLoaded) files.push("content/content.js");
+  if (files.length === 0) return false;
+  await chrome.scripting.executeScript({ target: { tabId }, files });
+  return true;
 }
 
 async function captureStepScreenshot(tabId, captureSettings, screenshots) {
@@ -793,6 +870,11 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
   replayLocks.set(tabId, true);
   activeReplayTabId = tabId;
   activeReplayOriginTabId = tabId;
+  // Scopes cross-tab domain matching (waitForTabWithDomain) to this replay's
+  // own window, so an unrelated same-hostname tab left open elsewhere (a
+  // different recording's leftover tab, a manually opened tab, etc.) can't
+  // get silently adopted as the redirect target.
+  const replayWindowId = (await chrome.tabs.get(tabId).catch(() => null))?.windowId ?? null;
   const report = buildReport({ envId: env?.id || null, steps, recordingId });
   lastReportByTab.set(tabId, report); // Store initial report
   
@@ -887,6 +969,15 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
     const envs = (await store.get(ENV_KEY)) || [];
 
     for (let i = 0; i < steps.length; i += 1) {
+      // Unconditional trace — logs EVERY step the loop visits, before any
+      // skip/control-flow branch below has a chance to `continue` past it.
+      // If a step's id never shows up here, it never reached the loop body
+      // at all (e.g. missing from the `steps` array passed into this
+      // function); if it shows up here but not in the "Sending message to
+      // content script" trace further down, something between here and
+      // there is skipping it.
+      console.log(`[autotest][replay][step-trace] i=${i}/${steps.length} id=${steps[i]?.id} type=${steps[i]?.type} value=${JSON.stringify(steps[i]?.value)} selector=${steps[i]?.selector?.primary?.value || null}`);
+
       // Check if replay has been stopped
       if (!replayLocks.get(tabId)) {
         console.log("[autotest][replay] Replay stopped by user at step", i);
@@ -897,10 +988,12 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       }
       
       // Check if replay is paused
+      let wasPaused = false;
       if (pausedReplays.get(tabId)) {
         console.log("[autotest][replay] Entering pause wait loop at step", i, "tabId:", tabId);
       }
       while (pausedReplays.get(tabId)) {
+        wasPaused = true;
         // Also check if stopped while paused
         if (!replayLocks.get(tabId)) {
           console.log("[autotest][replay] Replay stopped while paused at step", i);
@@ -912,7 +1005,11 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         console.log("[autotest][replay] Paused at step", i, "- waiting for resume...");
         await new Promise(resolve => setTimeout(resolve, 500)); // Check every 500ms
       }
-      if (i > 0 && pausedReplays.has(tabId) === false) {
+      // Only log "Resumed" if this step actually went through the pause-wait
+      // loop above — pausedReplays.has(tabId) is false by default for nearly
+      // every step (whether or not pause was ever used), so checking that
+      // instead logged "Resumed!" on every single step, paused or not.
+      if (wasPaused) {
         console.log("[autotest][replay] Resumed! Continuing from step", i);
       }
       
@@ -999,7 +1096,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         continue;
       }
       
-      console.log("[autotest][replay] step start", { idx: i, type: step?.type, envId: stepEnv?.id || null });
+      console.log("[autotest][replay] step start", { idx: i, id: step?.id, type: step?.type, value: step?.value, envId: stepEnv?.id || null });
 
       // ── Cross-tab tab-index switch ───────────────────────────────────────
       // Switch tabs when the step's tabIndex differs from the currently active
@@ -1022,7 +1119,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           } catch (_) {}
 
           if (stepDomain && stepDomain !== currentDomain) {
-            newTab = await waitForTabWithDomain(stepDomain, 30000);
+            newTab = await waitForTabWithDomain(stepDomain, 30000, replayWindowId);
           } else if (pendingNewTabWatcher) {
             // Listener was pre-registered before the triggering step — guaranteed
             // to have caught the tab even if it opened before this code runs.
@@ -1053,7 +1150,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
 
         // Re-inject content scripts and show the HUD on the tab we just switched to
         try {
-          await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js", "content/content.js"] });
+          await ensureContentScriptsInjected(activeTabId);
           await new Promise(r => setTimeout(r, 500));
         } catch (injErr) {
           console.warn("[autotest][replay] Could not inject content scripts into switched tab:", injErr?.message);
@@ -1062,6 +1159,50 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         chrome.tabs.sendMessage(activeTabId, { type: "hud_show" }).catch(() => {});
         // Also activate the tab so it's visible
         chrome.tabs.update(activeTabId, { active: true }).catch(() => {});
+      }
+
+      // ── Same-tab cross-origin redirect (no tabIndex change) ────────────────
+      // Recording never emits an explicit "navigation" step for a hard
+      // (full-page) redirect — content.js only hooks pushState/replaceState/
+      // popstate/hashchange (see handleNavigation), and a real cross-origin
+      // redirect unloads the page before any of those can fire. This is
+      // exactly what happens handing off from the HDFC form to a third-party
+      // KYC vendor (Perfios, etc.) and back — the step right after the
+      // redirect still carries the new tabDomain, but nothing tells the loop
+      // below to expect a domain change on the SAME tab.
+      // Without this check, the ping-and-reinject logic a few lines down can
+      // catch the old page's content script still alive mid-navigation, then
+      // immediately search it for the next step's (wrong-page) selector —
+      // which reliably fails only after burning the full 10-minute
+      // element-search timeout in content.js. Waiting for the tab to actually
+      // reach the expected domain first turns that into a fast, correctly
+      // diagnosed failure (or just a short, correct wait) instead.
+      if (stepTabIndex === currentTabIndex && step.tabDomain) {
+        let currentDomain = null;
+        try {
+          const currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
+          if (currentTab?.url) currentDomain = new URL(currentTab.url).hostname;
+        } catch (_) {}
+
+        if (currentDomain && step.tabDomain !== currentDomain) {
+          console.log(`[autotest][replay] Step ${i} expects domain "${step.tabDomain}" but tab is on "${currentDomain}" — waiting for redirect to complete…`);
+          const settledTab = await waitForTabWithDomain(step.tabDomain, 30000, replayWindowId);
+          if (!settledTab) {
+            const err = new Error(`Expected the page to redirect to "${step.tabDomain}" but it never did within 30s (still on "${currentDomain}"). The preceding step likely didn't trigger the expected hand-off.`);
+            err.code = "DOMAIN_REDIRECT_TIMEOUT";
+            stepReport.status = "failed";
+            stepReport.error = { message: err.message, code: err.code };
+            lastReportByTab.set(tabId, report);
+            throw err;
+          }
+          console.log(`[autotest][replay] Step ${i}: Tab reached expected domain "${step.tabDomain}"`);
+          try {
+            await ensureContentScriptsInjected(activeTabId);
+            await new Promise(r => setTimeout(r, 300));
+          } catch (injErr) {
+            console.warn("[autotest][replay] Could not inject content scripts after cross-origin redirect:", injErr?.message);
+          }
+        }
       }
 
       // ── Pre-register tab watcher for the next step if it needs a same-domain switch ──
@@ -1123,11 +1264,19 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         
         const url = buildReplayUrl(stepEnv, step);
         console.log("[autotest][replay] navigation", { idx: i, url, kind: navKind });
+        // Arm the completion listener BEFORE triggering navigation so we can't
+        // miss the transition, then require a fresh "complete" event rather
+        // than trusting a possibly-stale status snapshot from the old page.
+        const tabCompletePromise = waitForTabComplete(activeTabId, 30000, { requireFreshLoad: true });
         await chrome.tabs.update(activeTabId, { url });
-        await waitForTabComplete(activeTabId);
+        await tabCompletePromise;
 
-        // Add delay to ensure content script is initialized
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Poll for the content script instead of blindly sleeping — it may be
+        // ready sooner (fast page) or later (slow bundle) than any fixed delay.
+        const scriptAlive = await waitForContentScriptAlive(activeTabId);
+        if (!scriptAlive) {
+          throw new Error("Content script did not respond after navigation.");
+        }
 
         const readyResp = await chrome.tabs.sendMessage(activeTabId, {
           type: "replay_wait_ready"
@@ -1221,28 +1370,14 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
       if (!contentScriptAlive) {
         console.log(`[autotest][replay] Step ${i}: Attempting to reinject content script...`);
         try {
-          await chrome.scripting.executeScript({
-            target: { tabId: activeTabId },
-            files: ['content/content.js']
-          });
-
           // Also reinject HUD if it was enabled for this tab
           const hudState = await chrome.storage.local.get([`hudEnabled_${activeTabId}`]);
-          if (hudState[`hudEnabled_${activeTabId}`]) {
-            await chrome.scripting.executeScript({
-              target: { tabId: activeTabId },
-              files: ['content/hud.js']
-            });
-          }
-          
+          await ensureContentScriptsInjected(activeTabId, { includeHud: !!hudState[`hudEnabled_${activeTabId}`] });
+
           console.log(`[autotest][replay] Step ${i}: Content script reinjected successfully`);
-          
-          // Wait for content script to initialize
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
-          // Verify it's now alive
-          const verifyResp = await chrome.tabs.sendMessage(activeTabId, { type: "ping" });
-          if (verifyResp?.alive) {
+
+          // Poll until the reinjected script responds instead of guessing a fixed delay.
+          if (await waitForContentScriptAlive(activeTabId)) {
             console.log(`[autotest][replay] Step ${i}: Content script verified after reinjection`);
             contentScriptAlive = true;
           }
@@ -1256,10 +1391,15 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
         throw new Error("Content script is not responding. The page may have been suspended or navigated.");
       }
 
-      console.log(`[autotest][replay] Step ${i}: Sending message to content script...`);
+      console.log(`[autotest][replay][step-trace] Step ${i}: Sending message to content script...`, { id: step?.id, type: step?.type, value: step?.value });
 
       let resp;
-      const stepTimeoutMs = 30000; // 30s max per step
+      // Must exceed content.js's own internal waits (up to 10 minutes for a
+      // slow-loading popup's target element / loading indicator, see
+      // DEFAULT_WAIT in content.js) plus a buffer, so this outer guard never
+      // fires first and masks the more specific ELEMENT_NOT_FOUND /
+      // LOADING_INDICATOR_TIMEOUT failure content.js would otherwise report.
+      const stepTimeoutMs = 660000; // 11 minutes max per step
       try {
         const sendStartTime = Date.now();
         resp = await Promise.race([
@@ -1269,18 +1409,21 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
             env: stepEnv,
             healingConfig: selectorHealing
           }),
-          new Promise((_, rej) => setTimeout(() => rej(new Error("Step execution timed out after 30s")), stepTimeoutMs))
+          new Promise((_, rej) => setTimeout(() => rej(new Error(`Step execution timed out after ${stepTimeoutMs / 1000}s`)), stepTimeoutMs))
         ]);
         const sendDuration = Date.now() - sendStartTime;
         
-        console.log(`[autotest][replay] Step ${i}: Received response from content script:`, {
+        console.log(`[autotest][replay][step-trace] Step ${i}: Received response from content script:`, {
+          id: step?.id,
           ok: resp?.ok,
-          code: resp?.code
+          code: resp?.code,
+          sendDuration
         });
       } catch (sendErr) {
         // If sendMessage fails, the page might have navigated.
         // Chrome uses several different strings for this class of error.
         const errMsg = sendErr?.message || String(sendErr);
+        console.error(`[autotest][replay][step-trace] Step ${i}: sendMessage THREW`, { id: step?.id, type: step?.type, value: step?.value, error: errMsg });
         const isChannelError = (
           errMsg.includes("Receiving end does not exist") ||
           errMsg.includes("message channel closed") ||
@@ -1290,49 +1433,91 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
           errMsg.includes("asynchronous response")   // "A listener indicated an asynchronous response..."
         );
 
+        let retriedAfterNav = false;
+
         if (isChannelError) {
           console.log("[autotest][replay] Step triggered navigation (channel closed), waiting for page load...");
           await waitForTabComplete(activeTabId);
           await new Promise(resolve => setTimeout(resolve, 500));
 
-          // Re-inject content scripts — they are destroyed when the page navigates
+          // Re-inject content scripts if the new page's own auto-injection
+          // (via manifest.json's content_scripts) hasn't happened/landed yet.
           try {
-            await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js"] });
-            await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/content.js"] });
+            await ensureContentScriptsInjected(activeTabId);
             console.log("[autotest][replay] Re-injected content scripts after navigation");
             await new Promise(resolve => setTimeout(resolve, 300));
           } catch (injectErr) {
             console.warn("[autotest][replay] Could not re-inject content scripts:", injectErr?.message);
           }
 
-          // Now verify the new page is ready
+          // Now verify the new page is ready. No artificial timeout here —
+          // replay_wait_ready itself already waits as long as genuinely
+          // needed (see waitForPageIdle); racing it against a short fixed
+          // timeout just aborts the whole replay on any page that happens to
+          // take longer than that to settle after the navigation.
           try {
-            const readyResp = await Promise.race([
-              chrome.tabs.sendMessage(activeTabId, { type: "replay_wait_ready" }),
-              new Promise((_, rej) => setTimeout(() => rej(new Error("ready check timeout")), 10000))
-            ]);
+            const scriptAlive = await waitForContentScriptAlive(activeTabId);
+            if (!scriptAlive) {
+              throw new Error("Content script did not respond after navigation.");
+            }
+            const readyResp = await chrome.tabs.sendMessage(activeTabId, { type: "replay_wait_ready" });
             if (readyResp?.ok) {
-              // Navigation completed successfully — treat the triggering step as passed
-              stepReport.status = "passed";
-              stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
-              lastReportByTab.set(tabId, report);
-              continue;
+              // A click/submit plausibly caused a real navigation, in which
+              // case the triggering step already did its job — assume passed.
+              // But "input"/"change" steps typing a value can NOT legitimately
+              // cause a channel-closing navigation on their own; a channel
+              // closure here almost always means an unrelated async re-render
+              // (e.g. a prefill/journey API call reshaping the DOM) raced with
+              // the input and killed the port before the value was confirmed
+              // set. Blindly marking it "passed" reports false success while
+              // the field is actually left empty — re-send it against the
+              // now-recovered page instead of assuming it worked.
+              if (step?.type === "input" || step?.type === "change") {
+                console.log(`[autotest][replay][step-trace] Step ${i}: re-sending input/change after channel closure (value likely never applied)`);
+                try {
+                  resp = await Promise.race([
+                    chrome.tabs.sendMessage(activeTabId, {
+                      type: "replay_execute_step",
+                      step,
+                      env: stepEnv,
+                      healingConfig: selectorHealing
+                    }),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error("Retry after channel closure timed out")), stepTimeoutMs))
+                  ]);
+                  console.log(`[autotest][replay][step-trace] Step ${i}: retry response`, { id: step?.id, ok: resp?.ok, code: resp?.code });
+                } catch (retryErr) {
+                  console.error(`[autotest][replay][step-trace] Step ${i}: retry after channel closure also failed`, retryErr?.message);
+                  resp = { ok: false, error: `Retry after channel closure failed: ${retryErr?.message}`, code: "RETRY_AFTER_NAV_FAILED" };
+                }
+                // Let the normal resp?.ok handling below (after this whole
+                // try/catch) report the retry's real outcome, instead of the
+                // unconditional failure branch further down.
+                retriedAfterNav = true;
+              } else {
+                stepReport.status = "passed";
+                stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
+                lastReportByTab.set(tabId, report);
+                continue;
+              }
             }
           } catch (readyErr) {
             console.error("[autotest][replay] Failed to verify page ready after navigation:", readyErr?.message);
           }
         }
-        // Not a navigation error, or verification failed — surface as step failure
-        if (softAssertions) {
-          // In soft mode, log and continue instead of aborting
-          console.warn(`[autotest][replay] Step ${i} failed (soft mode, continuing):`, errMsg);
-          stepReport.status = "soft_fail";
-          stepReport.error = { message: errMsg, code: "EXEC_ERROR", soft: true };
-          stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
-          lastReportByTab.set(tabId, report);
-          continue;
+
+        if (!retriedAfterNav) {
+          // Not a navigation error, or verification failed — surface as step failure
+          if (softAssertions) {
+            // In soft mode, log and continue instead of aborting
+            console.warn(`[autotest][replay] Step ${i} failed (soft mode, continuing):`, errMsg);
+            stepReport.status = "soft_fail";
+            stepReport.error = { message: errMsg, code: "EXEC_ERROR", soft: true };
+            stepReport.screenshot = await captureStepScreenshot(activeTabId, captureSettings, screenshots);
+            lastReportByTab.set(tabId, report);
+            continue;
+          }
+          throw new Error("Failed to execute step: " + errMsg);
         }
-        throw new Error("Failed to execute step: " + errMsg);
       }
       
       console.log("[autotest][replay] step response", { idx: i, ok: !!resp?.ok, code: resp?.code || null });
@@ -1413,7 +1598,7 @@ async function runReplayOnTab({ tabId, env, steps, recordingId, skipNavigation =
               // Try re-injecting on second attempt
               if (attempt === 1) {
                 try {
-                  await chrome.scripting.executeScript({ target: { tabId: activeTabId }, files: ["content/hud.js", "content/content.js"] });
+                  await ensureContentScriptsInjected(activeTabId);
                   await new Promise(r => setTimeout(r, 500));
                 } catch {}
               }
@@ -1818,6 +2003,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       try {
         await chrome.tabs.sendMessage(tabId, { type: "hud_recording_update", steps: [...list] });
       } catch (_) { /* HUD may not be active */ }
+      return { ok: true };
+    }
+
+    if (type === "patch_step_path") {
+      // Fired when content.js suppresses a click-triggered SPA navigation
+      // (pushState/replaceState/popstate/hashchange) — the step itself
+      // already recorded, but its relativePath/queryParams/hash still
+      // reflect the pre-navigation page. This patches the in-progress step
+      // to the page it actually landed on.
+      if (tabId == null) return { ok: false, error: "NO_TAB" };
+      const list = getStepsForTab(tabId);
+      const step = list.find((s) => s.id === message?.stepId);
+      if (step) {
+        if (typeof message.relativePath === "string") step.relativePath = message.relativePath;
+        if (message.queryParams) step.queryParams = message.queryParams;
+        if (typeof message.hash === "string") step.hash = message.hash;
+        try {
+          await chrome.tabs.sendMessage(tabId, { type: "hud_recording_update", steps: [...list] });
+        } catch (_) { /* HUD may not be active */ }
+      }
       return { ok: true };
     }
 
@@ -2329,6 +2534,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       };
       recordings.push(recording);
       await saveRecordings(recordings);
+
+      console.log("[autotest][recording-debug] Recording saved:", recording);
+      console.log("[autotest][recording-debug] Copy this JSON:\n" + JSON.stringify(recording, null, 2));
 
       return { ok: true, recording };
     }
